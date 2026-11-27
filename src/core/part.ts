@@ -13,6 +13,13 @@ export interface EngineOptions {
   executor: Executor
   outbox: Outbox
   prepareTicket?: (ticket: Ticket, outcome: Extract<AssessmentOutcome, { kind: 'accept' }>) => Ticket
+  /**
+   * Whether a ticket must name an approved Proposal to be created. When it returns true, an accept without one, or with a
+   * draft or unknown one, is refused; when it returns false the gate stays open and existing behaviour is unchanged.
+   */
+  proposalsRequired?: () => boolean
+  /** Points a new ticket's worker slot at the session the person named (C-12), before its first launch. */
+  bindWorker?: (ticketId: string, sessionId: string) => void
   now?: () => string
   emit?: (event: DomainEvent) => void
 }

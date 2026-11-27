@@ -21,16 +21,25 @@ export function SetupMessage({ problem, lead }: { problem: Pick<SetupProblem, 'c
     {problem.values.output && <span className="dt-detail dt-mono dt-clamp">{problem.values.output}</span>}
   </>
 }
-export function Section({ title, count, children, action, hint, badge, icon }: {
+export function Section({ title, count, children, action, hint, badge, icon, collapsible = false }: {
   title: string; count?: number | string; children: ReactNode; action?: ReactNode; hint?: string; badge?: ReactNode; icon?: IconName
+  /** Whether the person may fold the block away; it starts open, so folding is always their choice. */
+  collapsible?: boolean
 }) {
+  const [open, setOpen] = useState(true)
+  const head = <>
+    {icon && <span className="dt-section-icon"><Icon name={icon} size={14} /></span>}
+    <span className="dt-section-name">{title}</span>
+  </>
   return <section className="dt-section">
     <h2 className="dt-section-title">
-      {icon && <span className="dt-section-icon"><Icon name={icon} size={14} /></span>}<span className="dt-section-name">{title}</span>
+      {collapsible ? <button type="button" className="dt-section-toggle" aria-expanded={open} onClick={() => setOpen(!open)}>
+        <Icon name={open ? 'chevron-down' : 'chevron-right'} size={14} />{head}
+      </button> : head}
       {count !== undefined && <span className="dt-count">{count}</span>}{hint && <InfoTip text={hint} />}{badge}
       {action && <span style={{ marginLeft: 'auto' }}>{action}</span>}
     </h2>
-    {children}
+    {(!collapsible || open) && children}
   </section>
 }
 export function Hint({ children }: { children: ReactNode }) { return <p className="dt-hint">{children}</p> }

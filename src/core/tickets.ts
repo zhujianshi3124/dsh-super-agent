@@ -1,13 +1,12 @@
 /** Tickets: their lifecycle from an accept to their end, their Subscriptions and their Inputs. */
 import { key } from './ids.ts'
 import { UserError } from './errors.ts'
-import { latestAssignment, latestReport, liveTicket, readUntil, runningAssignment, settled, threadKey, waitsForPerson } from './model.ts'
+import { awaitingAdjudication, latestAssignment, latestReport, liveTicket, readUntil, runningAssignment, settled, threadKey } from './model.ts'
 import type { Assignment, ChannelRef, Evaluation, Follow, Mandate, PolicyEffect, ThreadRef, Ticket, TicketEndBy, TicketInput, TicketOutcome,
-  Trigger, TriggerDisposition } from './model.ts'
+  TicketStopReason, Trigger, TriggerDisposition } from './model.ts'
 import type { AssessmentOutcome } from './ports.ts'
 import { EnginePart, type EngineOptions } from './part.ts'
 import type { Replies } from './replies.ts'
-import { canRetry } from './stage.ts'
 
 const sameChannel = (a: ChannelRef, b: ChannelRef): boolean => JSON.stringify(a) === JSON.stringify(b)
 /** Whether an Input is a message no person wrote, such as CI's, a bot's, or the main Session's note. */
@@ -19,10 +18,17 @@ export const automatic = (input: TicketInput | undefined): boolean => input?.kin
 const readBefore = (input: Extract<TicketInput, { kind: 'trigger' }>, until: string): boolean => input.readAt === undefined
   ? (input.deliveredAt && input.deliveredAt > input.at ? input.deliveredAt : input.at) <= until : !!input.readAt && input.readAt < until
 const STATUS_REQUEST = 'Report the current ticket status with orchestrator_report. This is a status-only request: do not resume implementation or perform external actions.'
+/**
+ * The one sentence a worker that stopped halfway gets when the foreman lets it go on (C-13e item 2): fixed by the host,
+ * it carries no new requirement and is no clarification of the ticket (C-24).
+ */
+export const CONTINUE_REQUEST = '从停下的地方接着干这张工单。'
+/** The one sentence a worker gets when the foreman passes on the person's wrap-up (C-17b item 2): fixed by the host, no new requirement (C-24). */
+export const WRAP_UP_REQUEST = '用户收工：做完手上这一步，把进度写进交接文档，报收工，不要开始下一步。'
 
 /**
  * Manages each ticket's lifecycle: creates the ticket for an accept decision with its Mandate, Subscriptions, and first
- * Assignment, binds and attaches Threads, adds Inputs, resumes, retries, restarts, and ends tickets, and drops Subscriptions.
+ * Assignment, binds and attaches Threads, adds Inputs, retries, restarts, and ends tickets, and drops Subscriptions.
  * Coordinates with Replies for the acknowledgement an accept carries and with Executor to start, deliver to, and stop assignments.
  * Intake, Evals, Assignments, and Engine delegate ticket and subscription mutations here.
  */
@@ -40,8 +46,26 @@ export class Tickets extends EnginePart {
     // Fall back to the last trigger for Evals recorded before `primary` existed.
     const primary = this.repo.triggers.get(evaluation.primary ?? triggerIds.at(-1)!)
     const origin = { triggerId: primary?.id ?? triggerIds[0]!, triggerIds }
+    // A ticket belongs to the instruction the person confirmed, named by the accept's audit; with the gate on, one that
+    // names no instruction or a draft one is refused before anything is written, so no ticket exists without approval.
+    const proposalId = typeof outcome.audit?.proposal === 'string' ? outcome.audit.proposal : undefined
+    const proposal = proposalId === undefined ? undefined : this.repo.proposals.get(proposalId)
+    if (this.options.proposalsRequired?.() && proposal?.status !== 'approved' && proposal?.status !== 'dispatched') {
+      throw new UserError('notApproved', { proposal: proposalId ?? 'none' })
+    }
     let ticket: Ticket = { id, title: outcome.title, decisionId, mandate, channels: [], assignments: [], inputs: [], undelivered: [],
       createdAt: at, updatedAt: at, origin }
+    // The instruction and task this ticket carries (C-22, C-29), and the stopped ticket it continues, if any (N-13a).
+    const taskNumber = typeof outcome.audit?.task === 'number' ? outcome.audit.task : undefined
+    if (proposalId !== undefined) ticket.proposal = proposalId
+    if (taskNumber !== undefined) ticket.task = taskNumber
+    const continues = typeof outcome.audit?.continues === 'string' ? outcome.audit.continues : undefined
+    if (continues) ticket.continues = continues
+    // Completion criteria: the accept's copied lines, else the instruction task's own wording split into lines (N-08, C-13a).
+    const task = proposal && taskNumber !== undefined ? proposal.tasks[taskNumber - 1] : undefined
+    const criteria = (outcome.acceptance?.length ? outcome.acceptance : task?.accept?.split('\n') ?? [])
+      .map(item => item.trim()).filter(Boolean).slice(0, 8)
+    if (criteria.length) ticket.criteria = criteria
     for (const triggerId of triggerIds) {
       const channel = this.repo.triggers.get(triggerId)?.channel
       if (channel && !ticket.channels.some(item => sameChannel(item, channel))) ticket.channels.push(channel)
@@ -49,6 +73,16 @@ export class Tickets extends EnginePart {
     ticket = this.options.prepareTicket?.(ticket, outcome) ?? ticket
     const assignment = this.newAssignment(ticket)
     this.repo.tickets.save(ticket)
+    // The person may have named the worker session that takes this ticket (C-12); the slot is bound before its first launch.
+    // While that session finishes another ticket, this one waits for it: the launch reads its actual usage when it is free.
+    if ('workerSession' in outcome && outcome.workerSession) {
+      this.options.bindWorker?.(id, outcome.workerSession)
+      ticket.waitingFor = outcome.workerSession
+      this.repo.tickets.save(ticket)
+    }
+    // The instruction now has this ticket; later sub-tickets of the same instruction join it rather than needing a new approval.
+    if (proposal) this.repo.proposals.save({ ...proposal, status: 'dispatched', approvedAt: proposal.approvedAt ?? at,
+      dispatchedAt: proposal.dispatchedAt ?? at, ticketIds: proposal.ticketIds.includes(id) ? proposal.ticketIds : [...proposal.ticketIds, id] })
     for (const triggerId of triggerIds) for (const ref of this.repo.triggers.get(triggerId)?.threads ?? []) this.subscribe(id, ref)
     if (outcome.acknowledgement && primary) this.replies.acknowledgeAccepted(id, primary, outcome.acknowledgement)
     this.options.executor.start(this.require(id), assignment)
@@ -85,7 +119,7 @@ export class Tickets extends EnginePart {
       if (!done || this.unfinished(ticket, at)) continue
       // Work resumed after the close and finished ends now.
       const resumed = Date.parse(latestAssignment(ticket)?.createdAt ?? '') > Date.parse(at)
-      this.end(ticket.id, 'executor', done.outcome, resumed ? this.now() : done.at)
+      this.end(ticket.id, 'executor', done.outcome, resumed ? this.now() : done.at, undefined, 'delivered')
     }
   }
   /**
@@ -101,7 +135,7 @@ export class Tickets extends EnginePart {
   }
   /**
    * The Trigger to attach to a ticket, once the ticket may take it.
-   * @throws UserError when the trigger or ticket is unknown, a ticket's worker still decides the trigger, a person stopped the ticket, or an ended ticket's Mandate no longer revalidates.
+   * @throws UserError when the trigger or ticket is unknown, a ticket's worker still decides the trigger, a person stopped the ticket, or the ticket ended — an ended ticket takes nothing (C-11, N-13).
    */
   attachable(ticketId: string, triggerId: string): Trigger {
     const trigger = this.repo.triggers.get(triggerId)
@@ -110,13 +144,14 @@ export class Tickets extends EnginePart {
     this.leftToWorkers(trigger)
     const current = this.require(ticketId)
     if (current.ended?.by === 'human') throw new UserError('ticketStopped')
-    if (!liveTicket(current) && !this.policy().revalidate(current.mandate)) throw new UserError('mandateRevoked')
+    // A ticket that ended stays ended: what continues from its result is new work, which a new ticket carries (C-11).
+    if (!liveTicket(current)) throw new UserError('ticketEnded')
     return trigger
   }
   /**
-   * Subscribe a ticket to an attached Trigger's Threads and add the Trigger as an Input, with its note. The ticket's worker
-   * then decides it, as it decides a message that reached the ticket on its own Thread; a worker that does not hold the
-   * message as its ticket's takes it as a new Input, which wakes an ended ticket as any attached message does.
+   * Subscribe an open ticket to an attached Trigger's Threads and add the Trigger as an Input, with its note. The ticket's
+   * worker then decides it, as it decides a message that reached the ticket on its own Thread; a worker that does not hold
+   * the message as its ticket's takes it as a new Input.
    */
   attach(ticketId: string, trigger: Trigger, note?: string): void {
     for (const ref of trigger.threads) this.subscribe(ticketId, ref)
@@ -134,9 +169,9 @@ export class Tickets extends EnginePart {
       ...trigger.human ? { human: true } : {} })
     if (existing?.kind !== 'trigger') this.addInput(ticket, input(id))
     else if (note && ticket.undelivered.includes(id)) { existing.note = note; ticket.updatedAt = at; this.repo.tickets.save(ticket) }
-    // A person sent it to Eval, or the ticket let it go before its worker took it up, read it for context only, or ended after
-    // its worker had it, so the worker gets it again.
-    else if (requeued || !current.fanout.includes(ticketId) || context?.includes(ticketId) || !liveTicket(ticket)) {
+    // A person sent it to Eval, or the ticket let it go before its worker took it up, or its worker read it for context only,
+    // so the worker gets it again.
+    else if (requeued || !current.fanout.includes(ticketId) || context?.includes(ticketId)) {
       this.addInput(ticket, input(key('input', ticketId, 'trigger', trigger.id, 'attached', at)))
     }
     // The worker has the message already, so the note comes with it again.
@@ -154,29 +189,77 @@ export class Tickets extends EnginePart {
     return true
   }
   /**
-   * Stops a ticket on behalf of a human, ending any active assignments.
+   * Whether a ticket's worker stopped halfway (C-13e item 1): the ticket is open, its latest report is `waiting` — its turn
+   * ended with no report and no question — it waits for no adjudication (C-16a), and nothing reached it since: no Input
+   * waits for delivery and none was delivered after that report, either of which means its worker has work again.
+   */
+  stalled(ticket: Ticket): boolean {
+    const assignment = runningAssignment(ticket), report = assignment?.report
+    if (!liveTicket(ticket) || ticket.attention || !report || report.state !== 'waiting' || ticket.undelivered.length > 0) return false
+    return !(assignment?.deliveredAt && assignment.deliveredAt >= report.at)
+  }
+  /**
+   * Lets a worker that stopped halfway go on (C-13e item 2): the fixed sentence `CONTINUE_REQUEST` goes to it as an Input.
+   * Its delivery fulfils a pending rotation first, so a successor continues when one waits (C-13b).
+   * @returns whether the sentence was queued: false when the ticket did not stop halfway (see `stalled`).
    * @throws UserError when the ticket is unknown.
    */
-  stop(ticketId: string, reason?: string): Ticket {
-    this.end(ticketId, 'human', 'stopped', this.now(), reason)
+  continueStalled(ticketId: string): boolean {
+    const ticket = this.require(ticketId)
+    if (!this.stalled(ticket)) return false
+    this.addInput(ticket, { id: `continue:${ticketId}:${ticket.updatedAt}`, kind: 'text', text: CONTINUE_REQUEST, at: this.now() })
+    return true
+  }
+  /**
+   * Passes the person's wrap-up to a ticket's worker (C-17b item 2): the fixed sentence `WRAP_UP_REQUEST` goes to it as an Input.
+   * @throws UserError when the ticket is unknown or ended.
+   */
+  wrapUp(ticketId: string): void {
+    const ticket = this.require(ticketId)
+    if (!liveTicket(ticket)) throw new UserError('ticketEnded')
+    this.addInput(ticket, { id: `wrap-up:${ticketId}:${ticket.updatedAt}`, kind: 'text', text: WRAP_UP_REQUEST, at: this.now() })
+  }
+  /**
+   * Ends a ticket whose worker settled at the person's wrap-up (C-17b item 3): stop reason `wrapped`; the task goes on in a
+   * new ticket under the same instruction once the person starts work (N-13a).
+   * @throws UserError when the ticket is unknown.
+   */
+  endWrapped(ticketId: string, by: 'foreman' | 'system', reason?: string): Ticket {
+    this.end(ticketId, by, 'stopped', this.now(), reason, 'wrapped')
     return this.require(ticketId)
   }
   /**
-   * Ends the stalled assignment of a retryable open ticket (`failed`, `blocked`, or failed input delivery) and starts a new one.
-   * @throws UserError when the ticket is unknown or not retryable.
+   * Stops a ticket on behalf of a human, ending any active assignments (C-17a): stopped means ended, immediately.
+   * @throws UserError when the ticket is unknown.
    */
-  retry(ticketId: string): Ticket {
+  stop(ticketId: string, reason?: string): Ticket {
+    this.end(ticketId, 'human', 'stopped', this.now(), reason, 'user-stopped')
+    return this.require(ticketId)
+  }
+  /**
+   * The foreman stops a ticket's worker session: a stuck one (C-12b), every worker in an emergency (C-16b), or one that
+   * keeps stopping halfway with no progress, which ends failed (C-13e, N-13).
+   * The ticket ends with that stop reason; continuing the task takes a new ticket (N-13a).
+   * @throws UserError when the ticket is unknown.
+   */
+  stopByForeman(ticketId: string, stop: 'stuck' | 'emergency' | 'failed', reason?: string): Ticket {
+    this.end(ticketId, 'foreman', 'stopped', this.now(), reason, stop)
+    return this.require(ticketId)
+  }
+  /**
+   * Resumes a ticket whose worker stopped at a clean node awaiting adjudication (C-16a): the person's decision reaches the
+   * worker as an input and its session starts again at once. The ticket never ended, so this is no reopening (C-11).
+   * @throws UserError when the ticket is unknown, ended, or not awaiting adjudication.
+   */
+  resume(ticketId: string, instruction: string): Ticket {
     const ticket = this.require(ticketId)
-    const latest = latestAssignment(ticket)
-    if (!canRetry(ticket) || !latest) throw new UserError('notRetryable')
-    this.endAssignment(ticket, latest, 'retried')
-    this.requeueUntaken(ticket, latest)
-    const assignment = this.newAssignment(ticket)
+    if (!liveTicket(ticket)) throw new UserError('ticketEnded')
+    if (!ticket.attention) throw new UserError('notAdjudication')
+    delete ticket.attention
     ticket.updatedAt = this.now()
     this.repo.tickets.save(ticket)
-    this.options.executor.stop(ticket, latest, 'retried')
-    this.options.executor.start(ticket, assignment)
-    return ticket
+    this.addInput(ticket, { id: key('input', ticketId, 'adjudication', ticket.updatedAt), kind: 'text', text: instruction, at: this.now() })
+    return this.require(ticketId)
   }
   /**
    * Drops a ticket's Subscription to a Thread its worker found unrelated, and hands back, with `reason`, the person's messages there that the ticket decides.
@@ -234,39 +317,14 @@ export class Tickets extends EnginePart {
   addInput(ticket: Ticket, input: TicketInput): void {
     if (ticket.inputs.some(existing => existing.id === input.id)) return
     ticket.inputs.push(input); ticket.updatedAt = this.now()
-    // Hold back automated inputs while the worker is waiting on a person.
-    const held = liveTicket(ticket) && automatic(input) && waitsForPerson(ticket)
+    // Hold back automated inputs while the worker waits at a clean node for the person's adjudication (C-16a).
+    const held = liveTicket(ticket) && automatic(input) && awaitingAdjudication(ticket)
     if (!held) ticket.undelivered.push(input.id)
     this.repo.tickets.save(ticket)
     if (!liveTicket(ticket) || held) return
     const running = runningAssignment(ticket), latest = latestAssignment(ticket)
     if (running) this.options.executor.deliver(ticket, running)
-    else if (latest?.state === 'pending' && !waitsForPerson(ticket)) this.options.executor.start(ticket, latest)
-  }
-  /**
-   * Resume an ended ticket under its unchanged Mandate when a person's message on one of its Threads waits for it: no Eval
-   * and no Decision, since nothing new is authorized. One whose Mandate the current Policy no longer holds stays ended and
-   * takes nothing (see `refuse`). While processing is paused the message waits, and the first pass after the pause resumes
-   * the ticket under the Policy then. Reads the ticket afresh, so it is idempotent and leaves an already-resumed ticket alone.
-   */
-  wake(ticketId: string): void {
-    const ticket = this.repo.tickets.get(ticketId)
-    if (!ticket || liveTicket(ticket) || ticket.ended?.by === 'human' || !ticket.undelivered.length) return
-    const policy = this.policy()
-    if (policy.paused) return
-    if (!policy.revalidate(ticket.mandate)) { this.refuse(ticket); return }
-    // Only a human's message resumes an ended ticket; bot/CI triggers wait alongside inputs from before the ticket ended.
-    const first = ticket.undelivered.map(id => ticket.inputs.find(input => input.id === id)).find(input => input?.kind === 'trigger' && input.human)
-    if (first?.kind !== 'trigger') return
-    const at = this.now()
-    delete ticket.ended; ticket.updatedAt = at
-    const assignment = this.newAssignment(ticket)
-    // Prepend the resumed marker so it is delivered ahead of the waiting messages.
-    const resumed: TicketInput = { id: key('input', ticket.id, 'resumed', first.triggerId), kind: 'resumed', triggerId: first.triggerId, at }
-    ticket.inputs.push(resumed); ticket.undelivered.unshift(resumed.id)
-    this.repo.tickets.save(ticket)
-    this.options.executor.start(ticket, assignment)
-    this.emit('ticket.resumed', { ticketId, triggerId: first.triggerId })
+    else if (latest?.state === 'pending' && !awaitingAdjudication(ticket)) this.options.executor.start(ticket, latest)
   }
   /** The Triggers of a ticket's trigger Inputs, or of those of them whose Input ids are `ids`. */
   private triggersOf(ticket: Ticket, ids?: readonly string[]): Trigger[] {
@@ -286,7 +344,7 @@ export class Tickets extends EnginePart {
     return this.triggersOf(ticket, ids).filter(trigger => this.owners(trigger).includes(ticket.id) && !this.takenUp(ticket, trigger))
   }
   /**
-   * A ticket that ended, or cannot resume, lets go of the messages its worker never received, `waiting`, and of the person's
+   * A ticket that ends lets go of the messages its worker never received, `waiting`, and of the person's
    * messages it decided but may not have taken up, `left`: it no longer counts as having reached them, and each of `left`
    * that no other ticket decides goes to Eval, as a person's message that reached no ticket does, unless a ticket took it
    * up, a Decision settled it, or it is the message a stop ended this ticket on.
@@ -306,13 +364,6 @@ export class Tickets extends EnginePart {
       const decided = !!decision && (settled(decision) || stopped)
       if (!this.owners(trigger).length && !disposition?.acked?.length && !decided) this.queueForEval(trigger)
     }
-  }
-  /** An ended ticket that cannot resume takes none of the messages that waited for it (see `letGo`). */
-  private refuse(ticket: Ticket): void {
-    const waiting = this.triggersOf(ticket, ticket.undelivered), left = this.untaken(ticket, ticket.undelivered)
-    ticket.undelivered = []
-    this.repo.tickets.save(ticket)
-    this.letGo(ticket.id, waiting, left)
   }
   /** Replace a ticket's running Assignment with a new one that receives `note` first, and queue it for launch. */
   restart(ticket: Ticket, running: Assignment, reason: string, note: string): void {
@@ -342,28 +393,30 @@ export class Tickets extends EnginePart {
    * ends the ticket included (see `readBefore`), and neither acknowledged, answered nor handed back: one may have come while
    * the worker wrote the report that ends the ticket, or after its turn ended, and either way it can no longer hand it back.
    */
-  end(ticketId: string, by: TicketEndBy, outcome: TicketOutcome, at = this.now(), reason?: string): void {
+  end(ticketId: string, by: TicketEndBy, outcome: TicketOutcome, at = this.now(), reason?: string, stop?: TicketStopReason): void {
     const ticket = this.require(ticketId)
     if (!liveTicket(ticket)) return
     const stopping = ticket.assignments.filter(assignment => assignment.state !== 'ended')
     const why = reason && reason !== outcome ? { reason } : {}
+    // The canonical stop reason (N-13); a caller that passes none maps the legacy outcome onto one.
+    const stopped: TicketStopReason = stop ?? (outcome === 'stopped' ? (by === 'human' ? 'user-stopped' : 'failed') : 'delivered')
     const until = readUntil(ticket)
     const waiting = this.triggersOf(ticket, ticket.undelivered)
     const left = this.untaken(ticket, ticket.inputs.flatMap(input => input.kind === 'trigger'
       && (!readBefore(input, until) || ticket.undelivered.includes(input.id)) ? [input.id] : []))
     // An end dated earlier, such as a PR's merge, does not move the ticket's last change back.
-    ticket.ended = { at, by, outcome, ...why }; ticket.undelivered = []; ticket.updatedAt = this.now()
-    delete ticket.attention; delete ticket.delivery
+    ticket.ended = { at, by, outcome, stop: stopped, ...why }; ticket.undelivered = []; ticket.updatedAt = this.now()
+    delete ticket.attention; delete ticket.delivery; delete ticket.waitingFor
     // The Assignments the end stops end with it; the ticket's end says why.
     for (const assignment of stopping) { assignment.state = 'ended'; assignment.endedAt = at }
     this.repo.tickets.save(ticket)
     this.letGo(ticketId, waiting, left)
-    this.emit('ticket.ended', { ticketId, by, outcome, ...why })
+    this.emit('ticket.ended', { ticketId, by, outcome, stop: stopped, ...why })
     for (const assignment of stopping) this.options.executor.stop(ticket, assignment, reason ?? outcome)
   }
   /**
    * Whether a ticket's work has not finished at a close at `at`: its worker took up a person's message the ticket decides and
-   * has not reported other than progress, or ended a turn, since its Session took that message into a step, or work resumed
+   * has not reported other than progress, or ended a turn, since its Session took that message into a step, or work started
    * after the close, whose Assignment started after it, has no ready report or Input arrived after that report; a Policy
    * change asks for no work.
    */
@@ -398,6 +451,18 @@ export class Tickets extends EnginePart {
     const at = this.now()
     this.addInput(ticket, { id: key('input', ticketId, 'note', at, text), kind: 'note', text, at })
     return this.require(ticketId)
+  }
+  /**
+   * Record what the foreman decided about a ticket, so a successor foreman reads it instead of deciding or asking again (C-30).
+   * @throws UserError when the ticket is unknown.
+   */
+  decide(ticketId: string, text: string): Ticket {
+    const ticket = this.require(ticketId)
+    const at = this.now()
+    ticket.decisions = [...ticket.decisions ?? [], { at, text }]
+    ticket.updatedAt = at
+    this.repo.tickets.save(ticket)
+    return ticket
   }
   /**
    * Subscribe an open ticket to a Thread its Executor found related, for context: see `Thread.context`.

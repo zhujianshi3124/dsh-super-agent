@@ -1,7 +1,7 @@
 /** Shared view projections for triggers, tickets, threads, decisions, and channel links. */
 import { z } from 'zod'
-import { canRetry, followupOwners, latestReport, liveTicket, settled, threadKey, ticketStage, type ActorRef, type ChannelRef, type Decision,
-  type DecisionKind, type Thread, type ThreadFacts, type Ticket, type TicketStage, type Trigger } from '../../core/index.ts'
+import { followupOwners, latestReport, liveTicket, settled, threadKey, ticketStage, ticketStop, type ActorRef, type ChannelRef, type Decision,
+  type DecisionKind, type Thread, type ThreadFacts, type Ticket, type Trigger } from '../../core/index.ts'
 import { allowedSender, listedBot } from '../../policy.ts'
 import type { ChannelLink, Localized } from '../../sources/kind.ts'
 import type { SourceRegistry } from '../../sources/registry.ts'
@@ -10,7 +10,9 @@ import type { Store } from '../store.ts'
 import { attribute, markdown, plain, preview, readable } from './text.ts'
 
 export type LinkTarget = (channel: ChannelRef) => ChannelLink
-export interface ViewHost { store: Store; sources: SourceRegistry; links: LinkTarget }
+export interface ViewHost { store: Store; sources: SourceRegistry; links: LinkTarget; workerSession?: (ticketId: string) => string
+  /** Every worker session a ticket has used, current first, so its detail names each generation (C-29). */
+  workerSessions?: (ticketId: string) => string[] }
 export const page = <T>(items: T[], offset: number, limit: number) => ({ items: items.slice(offset, offset + limit), total: items.length, next_offset: offset + limit < items.length ? offset + limit : null })
 const DAY = 86_400_000
 export const dayAgo = () => new Date(Date.now() - DAY).toISOString()
@@ -106,28 +108,29 @@ export function triggerView(view: Snapshot, trigger: Trigger, threadDecisions?: 
         : undefined } }
 }
 export type TriggerView = ReturnType<typeof triggerView>
-/** Single-line summary of why a ticket in the `person` stage is waiting on human action (omitted once answered and back with the Executor). */
-function ticketNote(ticket: Ticket, stage: TicketStage): { text: string; error: boolean } | undefined {
-  if (stage.stage !== 'person') return undefined
-  if (stage.action === 'answer' && ticket.attention) return { text: preview(ticket.attention.question), error: false }
-  if (stage.action === 'delivery' && ticket.delivery) return { text: preview(ticket.delivery.error), error: true }
-  const summary = latestReport(ticket)?.summary
-  if ((stage.action !== 'blocked' && stage.action !== 'failed') || !summary) return undefined
-  return { text: preview(summary.split('\n')[0]!), error: stage.action === 'failed' }
+/** Single-line summary of what a ticket waits for: the adjudication question at its clean node (C-16a), or a failed input delivery. */
+function ticketNote(ticket: Ticket): { text: string; error: boolean } | undefined {
+  if (ticket.attention) return { text: preview(ticket.attention.question), error: false }
+  if (ticket.delivery) return { text: preview(ticket.delivery.error), error: true }
+  return undefined
 }
-export function ticketSummary(ticket: Ticket) {
+export function ticketSummary(ticket: Ticket, workerSession?: (ticketId: string) => string) {
   const stage = ticketStage(ticket)
-  const note = ticketNote(ticket, stage)
+  const note = ticketNote(ticket)
   const state = liveTicket(ticket) ? 'open' as const : 'ended' as const
-  return { id: ticket.id, title: ticket.title, state, ...stage, ...note ? { note } : {},
-    actions: { retry: canRetry(ticket), stop: liveTicket(ticket) }, strength: ticket.mandate.strength, ended: ticket.ended,
+  return { id: ticket.id, title: ticket.title, state, stage: stage.stage, ...note ? { note } : {},
+    // C-38: the panel's ticket actions are stop and open only; there is no retry (v2.22).
+    actions: { stop: liveTicket(ticket) }, strength: ticket.mandate.strength, ended: ticket.ended, stop: ticketStop(ticket),
     attention: ticket.attention && { ...ticket.attention, question: markdown(ticket.attention.question) },
       assignments: ticket.assignments.length, inputs: ticket.inputs.length, undelivered: ticket.undelivered.length,
-    // Every started Assignment of a Ticket runs in its one shared worker Session.
+    // Every started Assignment of a Ticket runs in its worker Session (the current generation after rotation).
     deliveryError: attribute(ticket.delivery?.error), sessionId: ticket.assignments.some(item => item.startedAt)
-      ? workerSessionId(ticket.id) : '',
+      ? (workerSession?.(ticket.id) ?? workerSessionId(ticket.id)) : '',
     directory: attribute(ticket.execution?.directory), summary: latestReport(ticket)?.summary ?? '', createdAt: ticket.createdAt,
-    updatedAt: ticket.updatedAt }
+    updatedAt: ticket.updatedAt,
+    // The instruction this ticket carries and the stopped ticket it continues (C-29, N-13a).
+    ...ticket.proposal ? { proposal: ticket.proposal } : {}, ...ticket.task !== undefined ? { task: ticket.task } : {},
+    ...ticket.continues ? { continues: ticket.continues } : {}, ...ticket.waitingFor ? { waitingFor: ticket.waitingFor } : {} }
 }
 export type TicketSummaryView = ReturnType<typeof ticketSummary>
 function threadUrl(store: Store, thread: Thread): string | undefined {
@@ -138,7 +141,7 @@ export function threadFacts(store: Store, thread: Thread) {
   return { key: thread.key, source: thread.ref.source, title: threadTitle(store, thread), ...url ? { url } : {}, facts: (thread.meta.facts ?? {}) as ThreadFacts }
 }
 export type ThreadFactsView = ReturnType<typeof threadFacts>
-export const ticketLine = (view: Snapshot, ticket: Ticket) => ({ ...ticketSummary(ticket),
+export const ticketLine = (view: Snapshot, ticket: Ticket) => ({ ...ticketSummary(ticket, view.workerSession),
   threads: view.threadsOf(ticket.id).map(thread => threadFacts(view.store, thread)) })
 export function threadTitle(store: Pick<Store, 'read'>, thread: Thread): string {
   const label = attribute(thread.meta.label)

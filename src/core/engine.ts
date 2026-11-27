@@ -40,9 +40,9 @@ export class Engine {
   // Sources
 
   /**
-   * A Source's request to take in a Trigger: store it once, fan it out to the tickets that subscribe to its Threads (to an
-   * ended one only a person's message, which resumes it at once unless processing is paused, and to none a person stopped),
-   * and queue it for Eval on its primary Thread unless a ticket's worker decides it (see `followupOwners`).
+   * A Source's request to take in a Trigger: store it once, fan it out to the live tickets that subscribe to its Threads
+   * (to none an ended or stopped ticket), and queue it for Eval on its primary Thread unless a ticket's worker decides it
+   * (see `followupOwners`).
    * Triggers that arrive while an Eval of that Thread runs wait together for the next one.
    */
   receive(trigger: Trigger): ReceiveResult { return this.repo.atomic(() => this.intake.receive(trigger)) }
@@ -67,18 +67,15 @@ export class Engine {
   // The clock
 
   /**
-   * Requeues overdue Evals up to `REQUEUES` times before recording `unavailable` (undelivered Evals never expire), starts the
-   * Evals of Threads whose queued Triggers wait, and resumes ended tickets a person's message reached while processing was
-   * paused. While processing is paused, nothing expires: each Eval in progress notes when the pause began, and its deadline
-   * moves forward by the pause's length once processing resumes. Each Eval and each ticket update takes one transaction.
+   * Requeues overdue Evals up to `REQUEUES` times before recording `unavailable` (undelivered Evals never expire) and starts
+   * the Evals of Threads whose queued Triggers wait. While processing is paused, nothing expires: each Eval in progress notes
+   * when the pause began, and its deadline moves forward by the pause's length once processing resumes. Each Eval and each
+   * ticket update takes one transaction.
    */
   evaluateDue(): void {
     const policy = this.options.policy()
     for (const thread of this.repo.threads.active()) if (thread.evaluating) this.repo.atomic(() => { this.evals.due(thread, policy) })
     if (policy.paused) return
-    for (const ticket of this.repo.tickets.active()) {
-      if (!liveTicket(ticket) && ticket.undelivered.length) this.repo.atomic(() => { this.tickets.wake(ticket.id) })
-    }
     for (const thread of this.repo.threads.active()) {
       if (thread.pending.length && !thread.evaluating) this.repo.atomic(() => { this.evals.start(thread.key, policy) })
     }
@@ -99,12 +96,11 @@ export class Engine {
    */
   decide(triggerId: string, outcome: Outcome): Decision { return this.repo.atomic(() => this.evals.decide(triggerId, outcome)) }
   /**
-   * Attach a Trigger to a ticket that the message points at: the ticket follows the Trigger's Threads and receives it as an
-   * Input with the routing note, and the Eval that holds the Trigger ends, since the ticket has it now; the other Triggers of
-   * its batch wait for a fresh Eval. A note for an Input the worker already received goes out as a new Input, and so does a
-   * message the ticket let go, read for context only, or had before it ended. An ended ticket resumes under its Mandate, at
-   * once unless processing is paused.
-   * @throws UserError for a ticket a person stopped, which withdrew its Mandate, or one whose Mandate the Policy no longer holds.
+   * Attach a Trigger to an open ticket that the message points at: the ticket follows the Trigger's Threads and receives it
+   * as an Input with the routing note, and the Eval that holds the Trigger ends, since the ticket has it now; the other
+   * Triggers of its batch wait for a fresh Eval. A note for an Input the worker already received goes out as a new Input, and
+   * so does a message the ticket let go or read for context only. An ended ticket takes nothing (C-11, N-13).
+   * @throws UserError for a ticket a person stopped, which withdrew its Mandate, or an ended ticket.
    */
   attach(ticketId: string, triggerId: string, note?: string): Ticket {
     return this.repo.atomic(() => {
@@ -115,7 +111,6 @@ export class Engine {
       this.evals.withdraw(trigger)
       this.tickets.attach(ticketId, trigger, note)
       this.evals.routed(triggerId, ticketId)
-      this.tickets.wake(ticketId)
       return this.repo.tickets.get(ticketId)!
     })
   }
@@ -154,25 +149,53 @@ export class Engine {
    */
   unsubscribe(thread: string): boolean { return this.repo.atomic(() => this.tickets.dropSubscriptions(thread, 'person')) }
   /**
-   * A person stops a ticket, which withdraws its Mandate: it ends and receives nothing more.
+   * A person stops a ticket, which withdraws its Mandate: it ends and receives nothing more (C-17a).
    * @throws UserError when the ticket is unknown.
    */
   stopTicket(ticketId: string, reason?: string): Ticket { return this.repo.atomic(() => this.tickets.stop(ticketId, reason)) }
   /**
-   * A person retries a ticket whose worker reported failed or blocked (or whose input delivery failed): the stalled
-   * Assignment ends and a new one starts under the same Mandate.
-   * @throws UserError when the ticket is unknown, has ended, or is not retryable.
+   * The foreman stops a stuck worker's ticket (C-12b), every worker's ticket in an emergency (C-16b), or a ticket whose
+   * worker keeps stopping halfway with no progress, which ends failed (C-13e); each ends with that stop reason, and
+   * continuing a task takes a new ticket (N-13a).
+   * @throws UserError when the ticket is unknown.
    */
-  retryTicket(ticketId: string): Ticket { return this.repo.atomic(() => this.tickets.retry(ticketId)) }
+  stopTicketByForeman(ticketId: string, stop: 'stuck' | 'emergency' | 'failed', reason?: string): Ticket {
+    return this.repo.atomic(() => this.tickets.stopByForeman(ticketId, stop, reason))
+  }
+  /**
+   * The foreman lets a worker that stopped halfway go on (C-13e): the fixed sentence goes to it, and a pending rotation is
+   * fulfilled before it lands, so a successor continues when one waits.
+   * @returns whether it was sent: false when the ticket did not stop halfway.
+   * @throws UserError when the ticket is unknown.
+   */
+  continueTicket(ticketId: string): boolean { return this.repo.atomic(() => this.tickets.continueStalled(ticketId)) }
+  /**
+   * The foreman passes the person's wrap-up to a ticket's worker (C-17b item 2): the host's fixed sentence goes to it.
+   * @throws UserError when the ticket is unknown or ended.
+   */
+  wrapUpTicket(ticketId: string): void { this.repo.atomic(() => this.tickets.wrapUp(ticketId)) }
+  /** A ticket whose worker settled at the person's wrap-up ends with stop reason `wrapped` (C-17b item 3). */
+  endWrapped(ticketId: string, by: 'foreman' | 'system', reason?: string): Ticket {
+    return this.repo.atomic(() => this.tickets.endWrapped(ticketId, by, reason))
+  }
+  /** Whether a ticket's worker stopped halfway (C-13e): open, its latest report `waiting`, awaiting no adjudication. */
+  stalled(ticketId: string): boolean { const ticket = this.repo.tickets.get(ticketId); return !!ticket && this.tickets.stalled(ticket) }
+  /**
+   * The foreman passes the person's adjudication to a ticket waiting at a clean node: its worker starts again at once (C-16a).
+   * @throws UserError when the ticket is unknown, ended, or not awaiting adjudication.
+   */
+  resumeTicket(ticketId: string, instruction: string): Ticket { return this.repo.atomic(() => this.tickets.resume(ticketId, instruction)) }
+  /** Record what the foreman decided about a ticket, which a successor reads instead of deciding or asking again (C-30). */
+  recordDecision(ticketId: string, text: string): Ticket { return this.repo.atomic(() => this.tickets.decide(ticketId, text)) }
 
   // The Executor
 
   /**
-   * The Executor's fact that an Assignment runs; the Inputs that wait for it go out.
+   * The Executor's fact that an Assignment runs, in `sessionId`'s Session; the Inputs that wait for it go out.
    * @throws UserError when the ticket is unknown.
    */
-  assignmentStarted(ticketId: string, assignmentId: string): void {
-    this.repo.atomic(() => { this.assignments.started(ticketId, assignmentId) })
+  assignmentStarted(ticketId: string, assignmentId: string, sessionId?: string): void {
+    this.repo.atomic(() => { this.assignments.started(ticketId, assignmentId, sessionId) })
   }
   /**
    * The Executor's fact that Inputs reached the Assignment that runs the ticket, which clears a failed delivery. A fact about
@@ -260,11 +283,13 @@ export class Engine {
 /** What Sources ask and tell the Engine. */
 export type EngineForSources = Pick<Engine, 'receive' | 'bindThread' | 'threadClosed'>
 /** What the main Session asks of the Engine. */
-export type EngineForMainSession = Pick<Engine, 'candidate' | 'candidateDelivered' | 'decide' | 'attach' | 'reply' | 'requestStatus' | 'note'>
+export type EngineForMainSession = Pick<Engine, 'candidate' | 'candidateDelivered' | 'decide' | 'attach' | 'reply' | 'requestStatus' | 'note'
+  | 'recordDecision'>
 /** What people ask of the Engine, through the panel or the main Session. */
-export type EngineForPeople = Pick<Engine, 'stopTicket' | 'retryTicket' | 'reevaluate' | 'unsubscribe' | 'dismiss'>
+export type EngineForPeople = Pick<Engine, 'stopTicket' | 'stopTicketByForeman' | 'wrapUpTicket' | 'endWrapped' | 'continueTicket' | 'stalled' | 'resumeTicket' | 'reevaluate'
+  | 'unsubscribe' | 'dismiss'>
 /** What Settings tells the Engine. */
 export type EngineForSettings = Pick<Engine, 'policyChanged'>
 /** What the Executor tells the Engine, and what its workers ask of it. */
-export type EngineForExecutor = Pick<Engine, 'assignmentStarted' | 'inputsDelivered' | 'inputsRead' | 'turnEnded' | 'deliveryFailed'
+export type EngineForExecutor = Pick<Engine, 'endWrapped' | 'assignmentStarted' | 'inputsDelivered' | 'inputsRead' | 'turnEnded' | 'deliveryFailed'
   | 'assignmentInterrupted' | 'report' | 'markUnrelated' | 'handback' | 'followForContext' | 'reply'>

@@ -1,23 +1,17 @@
-/** Executor Session tools for reading ticket context, acknowledging requests, managing threads, handing back out-of-scope triggers, and reporting status. */
+/** Worker Session tools: read the ticket's context, hand back out-of-scope input to the foreman (C-24), and report (N-09). */
 import { z } from 'zod'
 import { liveTicket, type EngineForExecutor, type Ticket } from '../../core/index.ts'
-import { IM_WORDS } from '../../infra/text.ts'
-import { claimPull, readPull } from '../../sources/github-pull.ts'
-import type { SourceContext } from '../../sources/host.ts'
 import { readResource, type ResourceHost } from '../resources.ts'
 import type { Store } from '../store.ts'
-import { reportRelay, threadFollowedNotice } from '../notices.ts'
+import { reportRelay } from '../notices.ts'
 import type { Sessions } from '../sessions.ts'
-import { AcknowledgementSchema, readTool, tool, type Tool } from './tool.ts'
+import { readTool, tool, type Tool } from './tool.ts'
 
 export interface ExecutorToolsHost {
-  readonly engine: Pick<EngineForExecutor, 'report' | 'reply' | 'markUnrelated' | 'handback' | 'followForContext'>
-  readonly store: Pick<Store, 'tickets' | 'replyStatus' | 'atomic'>
-  readonly sessions: Pick<Sessions, 'relay' | 'notify'>
+  readonly engine: Pick<EngineForExecutor, 'report' | 'handback'>
+  readonly store: Pick<Store, 'tickets' | 'atomic' | 'triggers'>
+  readonly sessions: Pick<Sessions, 'foremanRelay'>
   readonly resources: ResourceHost
-  /** GitHub Source context whose pull-request rules govern claiming a reported PR. */
-  readonly github: SourceContext
-  sendReplies(): Promise<void>
 }
 
 export function executorTools(host: ExecutorToolsHost, ticket: Ticket): Tool[] {
@@ -26,77 +20,48 @@ export function executorTools(host: ExecutorToolsHost, ticket: Ticket): Tool[] {
     readTool('Read one page of a resource of this ticket that the resource parameter lists. Follow next_offset, and next_resource where a page names one.',
       true, (resource, offset, limit, signal) => readResource(host.resources, resource, offset, limit, ticketId, signal)),
     tool({
-      name: 'orchestrator_ack',
-      description: 'Acknowledge one original human request before substantial work, as the replies section says; it posts as a reply to that message.',
-      schema: z.object({
-        trigger_id: z.string(),
-        text: AcknowledgementSchema.describe(`At most ${IM_WORDS} words; Markdown is supported.`),
-      }).strict(),
-      execute: async args => {
-        const reply = host.engine.reply({ purpose: 'acknowledgement', ticketId, triggerId: args.trigger_id, text: args.text })
-        if (reply.status !== 'sent') await host.sendReplies()
-        return { trigger_id: args.trigger_id, acknowledgement: host.store.replyStatus(reply.id)!, reused: reply.reused }
-      },
-    }),
-    tool({
-      name: 'orchestrator_thread_unrelated',
-      description: 'Stop following an attached thread that is not about this ticket, as the work section says; its own threads cannot be dropped.',
-      schema: z.object({
-        thread: z.string().min(1).describe('The thread key, which trigger/<id> of one of its messages shows as thread, such as feishu:<chat>:<root> or github:<number>.'),
-        reason: z.string().trim().min(1).max(300).describe('One sentence on why the thread is not about this ticket.'),
-      }).strict(),
-      execute: async args => { host.engine.markUnrelated(ticketId, args.thread, args.reason); return { removed: true, thread: args.thread } },
-    }),
-    tool({
-      name: 'orchestrator_thread_follow',
-      description: 'Follow a related thread, such as an Issue or another PR, for context only.',
-      schema: z.object({
-        thread: z.string().describe('Thread key, such as github:<number>.'),
-        reason: z.string().trim().min(1).max(300).describe('How it relates, in one sentence.'),
-      }).strict(),
-      execute: async args => host.store.atomic(() => {
-        const at = args.thread.indexOf(':')
-        if (at < 1 || at === args.thread.length - 1) throw new Error('A thread key is <source>:<id>, such as github:<number>')
-        const followed = host.engine.followForContext(ticketId, { source: args.thread.slice(0, at), id: args.thread.slice(at + 1) })
-        if (followed) host.sessions.notify(...threadFollowedNotice(ticketId, args.thread, args.reason))
-        return { followed, thread: args.thread }
-      }),
-    }),
-    tool({
       name: 'orchestrator_trigger_handback',
-      description: 'Hand back a message that asks for work beyond this ticket or for another one, for a fresh assessment; once per message. queued is false while another ticket still decides it, and for a message that was never this ticket\'s to decide, such as a bot\'s, which is assessed without it.',
+      description: 'Hand a message that asks for work beyond this ticket back to the foreman (C-24): the foreman judges whether it is a clarification of this ticket or a new requirement that needs a new instruction. Never answer it yourself and never treat a new requirement as a clarification; once per message.',
       schema: z.object({
         trigger_id: z.string().min(1),
         reason: z.string().trim().min(1).max(300).describe('One sentence on what it asks for beyond this ticket.'),
       }).strict(),
-      execute: async args => ({ trigger_id: args.trigger_id, queued: host.engine.handback(ticketId, args.trigger_id, args.reason) }),
+      execute: async args => {
+        const queued = host.engine.handback(ticketId, args.trigger_id, args.reason)
+        // The foreman receives the handed-back message itself, so it can judge clarification versus new requirement (C-24).
+        const trigger = host.store.triggers.get(args.trigger_id)
+        host.sessions.foremanRelay(`handback:${ticketId}:${args.trigger_id}`, JSON.stringify({ kind: 'worker_handback', ticket_id: ticketId,
+          trigger_id: args.trigger_id, text: trigger?.text ?? '', reason: args.reason,
+          note: 'The worker handed this message back. Judge it against the ticket\'s goal and completion criteria: a clarification goes back to the worker as input; a new requirement needs a new instruction from the main Session (C-24, C-08). Do not ask the person which it is unless C-15 applies.' }))
+        return { trigger_id: args.trigger_id, queued }
+      },
     }),
     tool({
       name: 'orchestrator_report',
-      description: 'Report progress, ready, blocked, failed or dropped, as the work and handoff sections say.',
+      description: 'Report to the foreman that dispatched this ticket, and to nobody else (C-16a, N-09): ready when the work is done (the ticket ends with stop reason delivered), blocked with a question when a C-15 situation needs the person\'s adjudication (the ticket keeps going; stop at a clean node and wait), failed when the work cannot be done or misses the completion criteria. Progress reports stay internal and reach nobody. Write the report so the foreman can act on it without reading your transcript.',
       schema: z.object({
-        state: z.enum(['progress', 'ready', 'blocked', 'failed', 'dropped']),
-        summary: z.string().min(1),
-        human_action: z.string().trim().min(1).max(1000).nullish().describe('One concrete question for a person, also with state=progress; omit to keep the pending one, null to clear it.'),
-        question_for_trigger_id: z.string().optional().describe('With human_action: the human message that raised the question, which is asked where that person wrote.'),
-        pr_number: z.number().int().positive().nullish().describe(`The ticket's PR: its source PR, or one by ${host.github.deployment.github.login} from a branch named after this ticket (DSH_SUPERAGENT_NAME).`),
-        reply_to_trigger_id: z.string().optional().describe('The explicit human question this report answers; never for ordinary progress.'),
+        state: z.enum(['progress', 'ready', 'blocked', 'failed', 'wrapped']).describe('wrapped only after the host\'s 用户收工 sentence, once your step is done and your handoff written (C-17b): the ticket ends with stop reason wrapped.'),
+        summary: z.string().min(1).describe('The report itself: what was done and the evidence, or what blocks the work. Stored word for word in the ticket (C-29).'),
+        human_action: z.string().trim().min(1).max(1000).nullish().describe('With state=blocked: the one concrete question for the person, with options and a recommendation when you can give them (C-16). Omit to keep the pending one, null to clear it.'),
+        human_action_kind: z.number().int().min(2).max(7).nullish().describe('With human_action: which C-15 situation it is — 2 only the person can do (login, authorization, credential, button), 3 goal or criteria change, 4 direction infeasible, 5 dangerous operation, 6 no model has quota, 7 machine limitation. The panel labels the pending ticket with it (C-37.1).'),
+        question_for_trigger_id: z.string().optional().describe('With human_action: the person\'s message that raised the question, when there is one.'),
+        stop_reason: z.enum(['session-stopped', 'failed']).nullish().describe('With state=blocked or failed: session-stopped when this session can no longer work at all (network, rate limit, quota — N-13b); failed otherwise. Omit for failed.'),
       }).strict(),
-      execute: async (args, signal) => {
+      execute: async args => {
         const current = host.store.tickets.get(ticketId)
-        if (!current || !liveTicket(current)) throw new Error('Ticket ended (PR was closed or work finished); do not resume it')
-        const pull = args.pr_number != null ? await readPull(host.github, args.pr_number, signal) : undefined
-        // Claim the PR, record the report, and queue the relay atomically so a rejected PR claim or invalid report leaves no partial state, and a recorded report always reaches the main Session.
+        if (!current || !liveTicket(current)) throw new Error('Ticket ended; it is never reopened (C-11). Continued work is a new ticket under the same instruction (N-13a).')
+        // Record the report and queue the relay atomically, so a rejected report leaves no partial state and a recorded one always reaches the foreman.
         return host.store.atomic(() => {
-          const refused = pull && claimPull(host.github, ticketId, pull)
-          if (refused) throw new Error(refused)
           const report = { state: args.state, summary: args.summary, ...(args.human_action !== undefined ? { question: args.human_action } : {}),
+            ...(args.human_action_kind ? { questionKind: args.human_action_kind } : {}),
             ...(args.question_for_trigger_id ? { askedBy: args.question_for_trigger_id } : {}),
-            ...(args.reply_to_trigger_id ? { answers: args.reply_to_trigger_id } : {}) }
+            ...(args.stop_reason ? { stopReason: args.stop_reason } : {}) }
           const updated = host.engine.report(ticketId, report)
           const relay = reportRelay(updated, report)
-          if (relay) host.sessions.relay(relay.id, relay.text)
-          const notification = relay ? 'orchestrator' : 'internal_only'
+          // A worker reports to the foreman that dispatched its ticket and to nobody else: the foreman collects every stopped
+          // worker's question, asks once and passes the result on through the main Session (C-16a, C-19).
+          if (relay) host.sessions.foremanRelay(relay.id, relay.text)
+          const notification = relay ? 'foreman' : 'internal_only'
           return { reported: true, notification, ...(updated.attention ? { attention: updated.attention } : {}) }
         })
       },

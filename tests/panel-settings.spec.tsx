@@ -1,5 +1,5 @@
 // @vitest-environment jsdom
-// The Settings groups, drafts, save bars and history.
+// The Settings groups, drafts, save bars and the execution save history (C-37f, C-38.4).
 import { act } from 'react'
 import { createRoot } from 'react-dom/client'
 import { Fields } from '../src/client/settings-kit.tsx'
@@ -9,10 +9,14 @@ import { usePanel, mount, remount, settle, all, find, tab, click, type, text, fi
 import { server } from './fixtures/panel-server.ts'
 
 usePanel()
-it('keeps a person\'s own value where another save changed the same setting, and says so', async () => {
+const executionSettings = async () => {
   await mount()
   await click(zh['tab.execution'])
   await click(find(zh['tab.settings'], '.dt-status-head button'))
+}
+
+it('keeps a person\'s own value where another save changed the same setting, and says so', async () => {
+  await executionSettings()
   await type(field<HTMLInputElement>(zh.maxWorkers), '6')
   server.settings = { ...server.settings, executor: { ...server.settings.executor, maxWorkers: 4 } }
   server.revisions.executor = 1
@@ -23,28 +27,20 @@ it('keeps a person\'s own value where another save changed the same setting, and
   expect(server.settings.executor.maxWorkers).toBe(6)
 })
 
-it('saves the Eval block on the Policy settings and the Executor with its execution environment on the Execution settings, each against its own revision', async () => {
-  await mount()
-  await click(zh['tab.eval'])
-  await click(find(zh['tab.settings'], '.dt-status-head button'))
-  await click(zh['mode.auto'])
-  await type(field<HTMLInputElement>(zh.evalTimeout), '180')
-  const [provider, model] = all('.dt-model input')
-  await type(provider as HTMLInputElement, 'worker-provider'); await type(model as HTMLInputElement, 'worker-model')
-  await click(zh.save)
-  expect(server.settings.eval).toEqual({ mode: 'auto', timeoutSeconds: 180, model: { provider: 'worker-provider', model: 'worker-model' } })
-  await click(find(zh['promptPart.runtime/work'], '.dt-settings-link'))
+it('saves the Executor with its execution environment, inserting a picked variable at the caret', async () => {
+  await executionSettings()
   await type(field<HTMLInputElement>(zh.maxWorkers), '5')
   // An empty root uses the default directory, which the field names instead of looking set.
-  expect(field<HTMLInputElement>(zh.executionDirectory).closest('.dt-field')!.querySelector('small')?.textContent).toBe('留空时用 /srv/dsh-superagent/work')
+  expect(field<HTMLInputElement>(zh.executionDirectory).closest('.dt-field')!.querySelector('small')?.textContent)
+    .toBe('留空时用 D:/buzhiding')
   await type(field<HTMLInputElement>(zh.executionDirectory), '/srv/work')
   // A variable picked from the list goes where the caret is in the prepare command.
   const prepare = field<HTMLTextAreaElement>(zh.prepareCommand)
   await type(prepare, 'git worktree add ')
   prepare.setSelectionRange(17, 17)
   await click('可用的环境变量 3')
-  expect(all('.dt-table tbody tr').map(row => row.textContent)).toEqual(['DSH_SUPERAGENT_DIR工单的执行目录执行器', 'DSH_SUPERAGENT_NAME工单短名执行器',
-    'DSH_SUPERAGENT_GITHUB_REPOSITORY仓库GitHub · 已关闭'])
+  expect(all('.dt-table tbody tr').map(row => row.textContent)).toEqual(['DSH_SUPERAGENT_DIR工单的执行目录',
+    'DSH_SUPERAGENT_NAME工单短名', 'DSH_SUPERAGENT_GITHUB_REPOSITORY仓库'])
   await click('DSH_SUPERAGENT_DIR')
   expect(field<HTMLTextAreaElement>(zh.prepareCommand).value).toBe('git worktree add "$DSH_SUPERAGENT_DIR"')
   await type(field<HTMLInputElement>(zh.blockedCommands), 'gh-personal  gh.other')
@@ -53,31 +49,36 @@ it('saves the Eval block on the Policy settings and the Executor with its execut
     'worker-model'); await type(effort as HTMLInputElement, 'high')
   expect([...document.querySelectorAll('#dt-worker-model-efforts option')].map(option => option.getAttribute('value'))).toEqual(['high'])
   await click(zh.save)
-  expect(server.settings.executor).toEqual({ maxWorkers: 5, directory: '/srv/work',
-    prepare: 'git worktree add "$DSH_SUPERAGENT_DIR"', blockedCommands: ['gh-personal', 'gh.other'], model: { provider: 'worker-provider',
-      model: 'worker-model', reasoningEffort: 'high' } })
-  expect(server.requests.filter(request => request.method === 'PUT').map(request => request.path)).toEqual(['settings/eval',
-    'settings/executor'])
+  expect(server.settings.executor).toMatchObject({ maxWorkers: 5, directory: '/srv/work',
+    prepare: 'git worktree add "$DSH_SUPERAGENT_DIR"', blockedCommands: ['gh-personal', 'gh.other'],
+    model: { provider: 'worker-provider', model: 'worker-model', reasoningEffort: 'high' } })
+  expect(server.requests.filter(request => request.method === 'PUT').map(request => request.path)).toEqual(['settings/executor'])
 })
 
-it('loads configuration history on demand with localized changes, Source field labels and notified Tickets', async () => {
-  server.history = { current: 3, policyVersion: 'abcdef1234567890', items: [{ revision: 3, savedAt: '2026-09-22T00:00:00Z',
-    source: 'sync', policyVersion: 'abcdef1234567890', policyChanged: true, notified: [{ id: 't1', title: '修复回归' }], block: 'policy',
-    changes: [{ code: 'mode', from: 'off', to: 'observe' }, { code: 'sourceRowsAdded', source: 'feishu', field: 'allowed', items: ['Bob'],
-      part: true }, { code: 'sourceField', source: 'feishu', field: 'syncChat', from: '', to: 'oc_team', part: true }] }] }
-  await mount()
-  await click(zh['tab.eval'])
-  await click(find(zh['tab.settings'], '.dt-status-head button'))
-  expect(server.requests.some(request => request.path === 'policy/history')).toBe(false)
+it('loads the execution history on demand with localized changes, and restores an earlier revision as a new save', async () => {
+  const executor = { model: null, maxWorkers: 2, directory: '', prepare: '', blockedCommands: [], stuckMinutes: 60 }
+  server.history = { current: 3, items: [
+    { revision: 3, savedAt: '2026-09-22T00:00:00Z', source: 'panel', block: 'executor',
+      executor: { ...executor, maxWorkers: 5 }, paused: true, notified: [{ id: 't1', title: '修复回归' }],
+      changes: [{ code: 'maxWorkers', from: 3, to: 5 }, { code: 'paused' }] },
+    { revision: 2, savedAt: '2026-09-21T00:00:00Z', source: 'sync', block: 'executor', executor, paused: false,
+      notified: [], changes: null }] }
+  await executionSettings()
+  expect(server.requests.some(request => request.path === 'settings/history')).toBe(false)
   await click(zh.configHistory)
-  for (const expected of ['第 3 次保存 · 从群同步', '生成策略版本 abcdef12', '接单模式：关闭 → 仅观察', '飞书 · 能发起工作的飞书用户 新增：Bob', '飞书 · 同步来源群：未设置 → oc_team',
-    '因策略变更通知了 1 个进行中的工单：修复回归']) expect(text()).toContain(expected)
+  for (const expected of ['第 3 次保存 · 管理页', '当前', '并发上限：3 → 5', '暂停派新工单', '通知了 1 张进行中的工单：修复回归',
+    '第 2 次保存 · 同步', '上一个版本没有记录，无法比较。']) expect(text()).toContain(expected)
+  // Only a revision other than the current one offers a restore; it saves that revision's executor block back.
+  expect(all('button').filter(button => button.textContent === zh.historyRestore)).toHaveLength(1)
+  await click(zh.historyRestore)
+  expect(text()).toContain('把执行设置回退到第 2 次保存的值？')
+  await click(zh.confirm)
+  expect(server.settings.executor.maxWorkers).toBe(2)
+  expect(server.requests.some(request => request.path === 'settings/executor' && request.method === 'PUT')).toBe(true)
 })
 
 it('shows save and discard only while a settings block has edits, at the end of that block', async () => {
-  await mount()
-  await click(zh['tab.execution'])
-  await click(find(zh['tab.settings'], '.dt-status-head button'))
+  await executionSettings()
   expect(all('.dt-savebar')).toHaveLength(0)
   await type(field<HTMLInputElement>(zh.maxWorkers), '6')
   expect(all('.dt-savebar')).toHaveLength(1)
@@ -99,13 +100,6 @@ it('shows save and discard only while a settings block has edits, at the end of 
   await click(save)
   expect(all('.dt-savebar')).toHaveLength(0)
   expect(document.activeElement).toBe(workers.form)
-  await click(find(zh['term.source'], '.dt-settings-link'))
-  expect(all('.dt-savebar')).toHaveLength(0)
-  const github = all('.dt-card').find(card => card.querySelector('.dt-card-title')?.textContent === 'GitHub')!
-  await type(field<HTMLInputElement>('智能体的 GitHub CLI'), 'gh-other')
-  expect(github.lastElementChild!.classList.contains('dt-savebar')).toBe(true)
-  // The agent CLI is read by setup, so the bar warns that saving restarts dsh-superagent and interrupts running work.
-  expect(github.lastElementChild!.textContent).toContain('2 个进行中的派工会中断')
 })
 
 it('gives the focus back to the field that had it once a block\'s save ends', async () => {
@@ -124,24 +118,21 @@ it('gives the focus back to the field that had it once a block\'s save ends', as
   expect(document.activeElement).toBe(input)
 })
 
-it('lists the settings groups stages first, opens each stage\'s group from its status, and returns to the last group opened',
-  async () => {
+it('lists the three settings groups, opens each from its place, and returns to the last group opened', async () => {
   await mount()
   await click(tab(zh['tab.settings']))
-  expect(all('.dt-settings-link').map(link => link.textContent)).toEqual(['来源', '评估', '执行', '提示词', '部署'])
-  expect(document.querySelector('.dt-settings-link[aria-current="page"]')?.textContent).toBe(zh['term.source'])
-  for (const [tab, group] of [['来源', '来源'], ['评估', '评估'], ['执行', '执行']] as const) {
-    await click(find(tab, '[role="tab"]'))
-    await click(find(zh['tab.settings'], '.dt-status-head button'))
-    expect(document.querySelector('.dt-settings-link[aria-current="page"]')?.textContent).toBe(group)
-  }
-  // The Trigger stage has no settings, so its status offers none.
-  await click(tab(zh['tab.trigger']))
-  expect(all('.dt-status-head button').map(button => button.textContent)).not.toContain(zh['tab.settings'])
-  await click(tab(zh['tab.settings']))
-  expect(document.querySelector('.dt-settings-link[aria-current="page"]')?.textContent).toBe(zh['promptPart.runtime/work'])
-  await click(tab(zh['tab.trigger']))
+  expect(all('.dt-settings-link').map(link => link.textContent)).toEqual(['执行', '提示词', '部署'])
+  expect(document.querySelector('.dt-settings-link[aria-current="page"]')?.textContent).toBe(zh['settingsGroup.execution'])
+  await click(find(zh['settingsGroup.prompts'], '.dt-settings-link'))
+  expect(document.querySelector('.dt-settings-link[aria-current="page"]')?.textContent).toBe(zh['settingsGroup.prompts'])
+  await click(find(zh['settingsGroup.deployment'], '.dt-settings-link'))
+  expect(document.querySelector('.dt-settings-title')?.textContent).toBe(zh['settingsGroup.deployment'])
+  // The Execution status opens its own group; a remount returns to the last group opened.
+  await click(tab(zh['tab.execution']))
+  await click(find(zh['tab.settings'], '.dt-status-head button'))
+  expect(document.querySelector('.dt-settings-link[aria-current="page"]')?.textContent).toBe(zh['settingsGroup.execution'])
+  await click(find(zh['settingsGroup.deployment'], '.dt-settings-link'))
   await remount()
   await click(tab(zh['tab.settings']))
-  expect(document.querySelector('.dt-settings-link[aria-current="page"]')?.textContent).toBe(zh['promptPart.runtime/work'])
+  expect(document.querySelector('.dt-settings-link[aria-current="page"]')?.textContent).toBe(zh['settingsGroup.deployment'])
 })

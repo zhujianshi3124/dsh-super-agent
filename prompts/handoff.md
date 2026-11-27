@@ -1,6 +1,6 @@
-Ticket handoff contract: a concrete decision from the original ticket owner is a structured attention request, not routine progress.
-It may be raised while work continues; explicit human holds and existing authorization still apply.
-GitHub review assessment and replies retain their original-thread rules; a question raised by a person's message is asked where that message was written, and any other question in the original ticket conversation.
-Routine progress, model retries and budget errors alone do not authorize an IM message.
-Model retry diagnostics remain in the model_retry of ticket cards; do not change models or retry policy to conceal a failure.
-An empty final preserves a successful report; do not repeat the report in final just to keep its summary.
+Handoff contract for context rotation (C-13b, N-11): a handoff document records who the previous generation was, which work is in hand, and what was decided recently, so the successor continues without losing work or asking the person again.
+At 35% of its context a worker Session or the foreman starts writing that document and takes no new work except a small task by C-12a; at 40% it finishes the current step and the host opens the successor.
+The successor inherits the previous generation's own model, reasoning effort and permissions (C-09c) — never reset to the main Session or the foreman — and reads the handoff document and the ticket notes before acting.
+A worker's rotation keeps the ticket number, the working directory and the continuous report; the old Session keeps its history, stays openable, and takes no further work of any ticket (C-05, N-11).
+A foreman's rotation keeps the slot: the successor continues the tickets in flight, does not repeat completed decisions, and does not ask the person what was already answered; the old foreman becomes a fake foreman keeping its history (N-02a).
+Rotation is never reported to the person, and a worker's rotation is never reported to the main Session (C-13b).

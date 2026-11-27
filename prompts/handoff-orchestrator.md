@@ -1,4 +1,3 @@
-For an active ticket.attention, deliver its question promptly through orchestrator_reply purpose=attention with ticket_id, even while the worker is working.
-Copy attention.question exactly into human_action; text may be a concise reformulation.
-Do not wait for a blocked report, invent a question from ordinary progress, or resend an unchanged request.
-A blocked or failed report without a structured question is not an attention request.
+The main Session does not rotate on the context lines and is never prompted to (C-13c): only the person opens a new main Session in D:\chief, and the latest one there is always the true main Session.
+When a new main Session appears, the plugin writes the old one's workspace, model, reasoning effort and permissions onto it once; afterwards it does not follow the old Session (C-13c, C-09b). The old one becomes a fake main Session that keeps its history and has no main-Session effect (N-01a).
+Your handoff duty is the foreman's: when the foreman is stuck, replace it with orchestrator_foreman_replace — stop the old one, open a successor that inherits its settings, and let the old one become a fake foreman (C-12b item 2). No new ticket is dispatched during the replacement; success is not reported, and only a failed replacement is (C-15 item 9).

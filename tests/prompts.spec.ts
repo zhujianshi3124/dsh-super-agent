@@ -3,11 +3,10 @@ import { tmpdir } from 'node:os'
 import { join, relative } from 'node:path'
 import { describe, expect, it } from 'vitest'
 import { Store } from '../src/app/store.ts'
-import { Prompts, builtInBase, composePrompt, defaultPrompts, policySection, promptParts, type PromptConfig } from '../src/app/prompts.ts'
+import { INSTRUCTION_SECTION, Prompts, builtInBase, composePrompt, defaultPrompts, promptParts, type PromptConfig } from '../src/app/prompts.ts'
 import { USER_ERRORS, UserError } from '../src/core/index.ts'
 import { KV } from '../src/kv.ts'
-import { SettingsSchema, policyVersion } from '../src/policy.ts'
-import { guides, handoffPolicy, mainAdmissionPolicy, masterPrompt, sharedPrompt, workerPrompt } from '../src/app/context.ts'
+import { guides, handoffPolicy, masterPrompt, sharedPrompt, workerPrompt } from '../src/app/context.ts'
 import { promptFile } from '../src/app/skill-files.ts'
 import { packagePath } from '../src/infra/paths.ts'
 import type { Variable } from '../src/app/execution-environment.ts'
@@ -48,13 +47,18 @@ it('assembles every role from fixed sections around the team sections, whatever 
   const config = { communication: 'Say little.', scope: '', delivery: 'Attach screenshots.', skills: {} }
   for (const role of ['orchestrator', 'worker'] as const) {
     const names = promptParts(config, role, 'env').map(part => part.name)
-    expect(names).toEqual(['runtime/shared', `runtime/${role}`, 'communication', 'delivery', 'runtime/subscriptions', 'runtime/replies', role === 'orchestrator' ? 'runtime/dispatch' : 'runtime/work', ...role === 'orchestrator' ? ['runtime/admission'] : [], 'runtime/handoff', 'runtime/environment'])
+    expect(names).toEqual(['runtime/shared', `runtime/${role}`, 'communication', 'delivery', 'runtime/inputs', 'runtime/reporting',
+      role === 'orchestrator' ? 'runtime/dispatch' : 'runtime/work', 'runtime/handoff', 'runtime/environment'])
     const prompt = composePrompt(config, role)
-    for (const fixed of [sharedPrompt, role === 'orchestrator' ? masterPrompt : workerPrompt, guides.subscriptions!, guides.replies!, handoffPolicy(role)]) expect(prompt).toContain(fixed)
+    for (const fixed of [sharedPrompt, role === 'orchestrator' ? masterPrompt : workerPrompt, guides.inputs!, guides.reporting!,
+      role === 'orchestrator' ? guides.dispatch! : guides.work!, handoffPolicy(role)]) expect(prompt).toContain(fixed)
     expect(prompt.endsWith(handoffPolicy(role))).toBe(true)
   }
-  expect(composePrompt(config, 'orchestrator')).toContain(mainAdmissionPolicy)
-  expect(composePrompt(config, 'worker')).not.toContain(mainAdmissionPolicy)
+  // The dispatch guidance belongs to the main Session alone; the work guidance to the worker alone (N-01, N-02).
+  expect(composePrompt(config, 'orchestrator')).toContain(guides.dispatch!)
+  expect(composePrompt(config, 'orchestrator')).not.toContain(guides.work!)
+  expect(composePrompt(config, 'worker')).toContain(guides.work!)
+  expect(composePrompt(config, 'worker')).not.toContain(guides.dispatch!)
 })
 
 it('reads a prompt file whatever its line ends and blank lines, and names a missing or empty one', () => {
@@ -70,12 +74,25 @@ it('reads a prompt file whatever its line ends and blank lines, and names a miss
   } finally { rmSync(dir, { recursive: true, force: true }) }
 })
 
+it('tells the main Session to draft and hand over instead of accepting while the foreman is on', () => {
+  withStore(store => {
+    const prompts = promptsOf(store)
+    // The foreman is part of the installation (C-26b): the main Session's prompt always carries the instruction rules.
+    expect(prompts.compose(defaultPrompts(), 'orchestrator')).toContain(INSTRUCTION_SECTION)
+    const composed = prompts.compose(defaultPrompts(), 'orchestrator')
+    expect(composed).toContain(INSTRUCTION_SECTION)
+    // Only the main Session changes: the worker and the foreman keep their own prompts.
+    expect(prompts.compose(defaultPrompts(), 'worker')).not.toContain('## Instructions')
+    expect(prompts.composeForeman(defaultPrompts())).not.toContain('## Instructions')
+  })
+})
+
 it('leaves the UI before-and-after evidence to the delivery requirements, which a team can change', () => {
   const config = { ...defaultPrompts(), delivery: 'Only capture the finished screen.' }
   for (const role of ['orchestrator', 'worker'] as const) expect(composePrompt(config, role)).not.toContain('Before and After visual evidence')
 })
 
-it.each(['orchestrator', 'worker'] as const)('ends the %s prompt with the fixed handoff rules and the execution environment, and the main Session\'s with its Policy', role => {
+it.each(['orchestrator', 'worker'] as const)('ends the %s prompt with the fixed handoff rules and the execution environment', role => {
   withStore(store => {
     const prompts = promptsOf(store)
     const preview = prompts.preview(defaultPrompts())
@@ -83,22 +100,22 @@ it.each(['orchestrator', 'worker'] as const)('ends the %s prompt with the fixed 
       text: handoffPolicy(role) })
     expect(preview[role]).toBe(prompts.compose(defaultPrompts(), role))
     expect(preview[role]).toContain(`${handoffPolicy(role)}\n\nExecution environment`)
-    if (role === 'worker') expect(preview[role].endsWith(ENVIRONMENT_LINE)).toBe(true)
-    // Nothing follows the main Session's Policy section, so a Policy change leaves the rest of its prompt as it was.
-    else expect(preview[role].endsWith(`${ENVIRONMENT_LINE}\n\n${policySection(store.settings()).text}`)).toBe(true)
-    expect(preview.parts[role].at(-1)!.name).toBe(role === 'orchestrator' ? 'runtime/policy' : 'runtime/environment')
+    // Both roles end with the generated execution environment; no Policy section follows it any more.
+    expect(preview[role].endsWith(ENVIRONMENT_LINE)).toBe(true)
+    expect(preview.parts[role].at(-1)!.name).toBe('runtime/environment')
   })
 })
 
-it('rejects unknown keys, built-in skill names and oversized configuration before persisting', () => {
+it('rejects unknown keys and oversized configuration before persisting', () => {
   withStore(store => {
     const prompts = promptsOf(store)
     expect(() => prompts.save({ ...defaultPrompts(), shared: 'x' }, 0, 'panel')).toThrow()
     expect(() => prompts.save({ communication: '', scope: '' }, 0, 'panel')).toThrow()
-    for (const name of ['github', 'feishu']) expect(() => prompts.save({ ...defaultPrompts(), skills: { [name]: 'mine' } }, 0, 'panel')).toThrow('built-in skill')
     expect(() => prompts.save({ ...defaultPrompts(), skills: { 'Bad Name': 'x' } }, 0, 'panel')).toThrow()
-    expect(() => promptsOf(store, 1000).save(defaultPrompts(), 0, 'panel')).toThrow('exceeds')
-    expect(prompts.current().revision).toBe(0)
+    // The installation ships no Source skills (C-06), so their names are ordinary team skill names now.
+    expect(prompts.save({ ...defaultPrompts(), skills: { github: 'mine' } }, 0, 'panel').config.skills).toEqual({ github: 'mine' })
+    expect(() => promptsOf(store, 1000).save(defaultPrompts(), 1, 'panel')).toThrow('exceeds')
+    expect(prompts.current().revision).toBe(1)
   })
 })
 
@@ -112,33 +129,33 @@ it('lists a ticket\'s execution environment in its prompt, and says setup is inc
   })
 })
 
-it('registers the built-in Source skills, Feishu only with a Feishu bot, before the team skills', () => {
+it('registers only the team\'s own skills; the installation ships no Source skills (C-06)', () => {
   withStore(store => {
     const config = { ...defaultPrompts(), skills: { release: 'Tag releases.' } }
     const skills = promptsOf(store).skills(config)
-    expect(skills.map(([name]) => name)).toEqual(['feishu', 'github', 'release'])
-    expect(skills[1]![1]).toContain('## CLI usage')
-    expect(skills[2]![1]).toBe('Tag releases.')
-    expect(new Prompts(store, () => 100000, variables, () => false).skills(config).map(([name]) => name)).toEqual(['github', 'release'])
+    expect(skills).toEqual([['release', 'Tag releases.']])
+    // Whether or not a Feishu bot is configured changes nothing: no built-in skill is registered either way.
+    expect(new Prompts(store, () => 100000, variables, () => false).skills(config)).toEqual([['release', 'Tag releases.']])
+    expect(promptsOf(store).skills(defaultPrompts())).toEqual([])
   })
 })
 
 
 describe('overrides of built-in parts', () => {
-  const settings = () => SettingsSchema.parse({})
   const config = (overrides: PromptConfig['overrides']) => ({ ...defaultPrompts(), overrides })
-  it('compose in place of the built-in texts, for the roles that read each, the handoff per role and the Source skills', () => {
+  it('compose in place of the built-in texts, for the roles that read each, and the handoff per role', () => {
     withStore(store => {
       const prompts = promptsOf(store)
       const edited = prompts.validate(config({ 'runtime/shared': { text: 'Shared, the team way.' }, 'runtime/dispatch': { text: '## dispatch\nRoute well.' },
-        'runtime/handoff/worker': { text: 'Hand off as a worker.' }, 'skill/github': { text: 'GitHub, the team way.' } }))
+        'runtime/handoff/worker': { text: 'Hand off as a worker.' } }))
       const main = prompts.compose(edited, 'orchestrator'), worker = prompts.compose(edited, 'worker')
       for (const prompt of [main, worker]) expect(prompt.startsWith('Shared, the team way.\n\n')).toBe(true)
       expect(main).toContain('## dispatch\nRoute well.')
       expect(main).not.toContain(guides.dispatch)
       expect(worker).toContain('Hand off as a worker.')
       expect(main).toContain(handoffPolicy('orchestrator'))
-      expect(prompts.skills(edited)).toContainEqual(['github', 'GitHub, the team way.'])
+      // Team skills are the configuration's own entries, registered as written (C-06).
+      expect(prompts.skills({ ...edited, skills: { github: 'GitHub, the team way.' } })).toContainEqual(['github', 'GitHub, the team way.'])
       // The parts say what they are edited by.
       expect(promptParts(edited, 'worker').find(part => part.name === 'runtime/handoff')).toMatchObject({ key: 'runtime/handoff/worker',
         text: 'Hand off as a worker.' })
@@ -147,26 +164,17 @@ describe('overrides of built-in parts', () => {
   it('fill the templates of the generated parts with the data, which stays generated', () => {
     withStore(store => {
       const prompts = promptsOf(store)
-      const edited = prompts.validate(config({ 'runtime/environment': { text: 'Where you work:\n{variables}\nAsk nobody for more.' },
-        'runtime/policy': { text: '## Policy\nRules of {version} in {mode} mode:\n{rules}' },
-        'runtime/policy/none': { text: '## Policy\n{version}, {mode}: nothing to accept.' } }))
+      const edited = prompts.validate(config({ 'runtime/environment': { text: 'Where you work:\n{variables}\nAsk nobody for more.' } }))
       expect(prompts.compose(edited, 'worker').endsWith(`Where you work:\n${ENVIRONMENT_LINE}\nAsk nobody for more.`)).toBe(true)
-      const policy = policySection(settings(), edited)
-      expect(policy).toEqual({ key: 'runtime/policy', text: `## Policy\nRules of ${policyVersion(settings())} in ${settings().eval.mode} mode:\n`
-        + settings().policy.rules.filter(rule => rule.enabled).map(rule => `- ${rule.name} (${rule.id}): ${rule.instruction}`).join('\n') })
-      const none = SettingsSchema.parse({ policy: { rules: [] } })
-      expect(policySection(none, edited)).toEqual({ key: 'runtime/policy/none', text: `## Policy\n${policyVersion(none)}, ${none.eval.mode}: nothing to accept.` })
-      // A rule's text that names a placeholder is not filled again.
-      const named = SettingsSchema.parse({ policy: { rules: [{ id: 'x', name: 'X', enabled: true, instruction: 'Keep {mode} and $& as written.' }] } })
-      expect(policySection(named, edited).text.endsWith('- X (x): Keep {mode} and $& as written.')).toBe(true)
+      // Text filled in is not read for placeholders again: a value that names one keeps it as written.
+      const tricky: Variable[] = [{ key: 'X', value: '{variables} $&', description: { zh: '', en: 'Tricky' }, owner: 'executor' }]
+      expect(new Prompts(store, () => 100000, () => tricky, () => true).compose(edited, 'worker')).toContain('- X = "{variables} $&": Tricky.')
     })
   })
   it('refuses an unknown part and a template that drops a placeholder, and drops an override equal to the built-in text', () => {
     withStore(store => {
       const prompts = promptsOf(store)
       expect(() => prompts.validate(config({ 'runtime/nothing': { text: 'x' } }))).toThrow(new UserError('unknownPromptPart', { part: 'runtime/nothing' }))
-      expect(() => prompts.validate(config({ 'runtime/policy': { text: '## Policy\n{version} {mode}' } })))
-        .toThrow(new UserError('promptPlaceholders', { part: 'runtime/policy', placeholders: '{rules}' }))
       expect(() => prompts.validate(config({ 'runtime/environment': { text: 'Where you work.' } })))
         .toThrow(new UserError('promptPlaceholders', { part: 'runtime/environment', placeholders: '{variables}' }))
       // Back to the built-in text: the part follows the built-in text again, so a later upgrade updates it.
@@ -180,17 +188,17 @@ describe('overrides of built-in parts', () => {
       const prompts = promptsOf(store)
       // An override edited from today's built-in text has nothing to show.
       const saved = prompts.save(config({ 'runtime/dispatch': { text: '## dispatch\nRoute well.' } }), 0, 'panel')
-      expect(saved.config.overrides!['runtime/dispatch']!.base).toBe(builtInBase(`## dispatch\n${guides.dispatch}`))
+      expect(saved.config.overrides!['runtime/dispatch']!.base).toBe(builtInBase(`## Dispatch\n${guides.dispatch}`))
       expect(prompts.defaultChanged(saved.config)).toEqual([])
       // One edited from a built-in text an earlier version shipped, which this installation kept when it was saved.
-      const earlier = '## replies\nAn earlier built-in text.'
+      const earlier = '## Inputs\nAn earlier built-in text.'
       store.set(KV.prompts.builtIn(builtInBase(earlier)), earlier)
-      const upgraded = prompts.save(config({ ...saved.config.overrides, 'runtime/replies': { text: 'Our replies.', base: builtInBase(earlier) },
+      const upgraded = prompts.save(config({ ...saved.config.overrides, 'runtime/inputs': { text: 'Our inputs.', base: builtInBase(earlier) },
         'runtime/work': { text: 'Our work.', base: 'unknown' } }), saved.revision, 'panel')
-      expect(prompts.defaultChanged(upgraded.config)).toEqual([{ part: 'runtime/replies', base: builtInBase(earlier), previous: earlier },
+      expect(prompts.defaultChanged(upgraded.config)).toEqual([{ part: 'runtime/inputs', base: builtInBase(earlier), previous: earlier },
         { part: 'runtime/work', base: 'unknown' }])
       // Kept as it was: an upgrade never replaces the team's text.
-      expect(prompts.compose(prompts.current().config, 'worker')).toContain('Our replies.')
+      expect(prompts.compose(prompts.current().config, 'worker')).toContain('Our inputs.')
     })
   })
   it('reads a configuration saved before overrides existed unchanged', () => {

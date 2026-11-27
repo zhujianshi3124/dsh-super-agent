@@ -93,9 +93,10 @@ Copy [examples/profile.cordis.patch.yml](../examples/profile.cordis.patch.yml) t
 | Key | Required | Meaning |
 | --- | --- | --- |
 | `stateDir` | yes | Absolute path: the database, the lock, the command shims in `worker-bin`, the agent's git configuration and, by default, the Ticket directories in `work`. Back it up before upgrades |
+| `masterWorkspace` | no | Absolute path the main Session runs in, where the person's own files are. Defaults to `D:/chief`, what the desktop shows; it is not the state directory. A change restarts dsh-superagent |
 | `promptMaxChars`, `admissionContextMaxPages`, `admissionContextTimeoutMs` | no | The largest saved prompt configuration, and how many Thread pages one assessment reads within what time |
 
-After the first start, edit machine limits in **Settings → Deployment** or the DeepSeek Harness Plugin Manager. Changes apply without restart. `stateDir` cannot be changed there. Invalid values or unknown configuration keys prevent startup; the log identifies the key.
+After the first start, edit machine limits in **Settings → Deployment** or the DeepSeek Harness Plugin Manager. Changes apply without restart. `stateDir` and `masterWorkspace` cannot be changed there. Invalid values or unknown configuration keys prevent startup; the log identifies the key.
 
 ## Start and stop
 
@@ -139,6 +140,18 @@ Check dsh-superagent: run `scripts/dsh-superagent --profile superagent status` i
 ```
 
 `--respect-stop` preserves an intentional stop. Only `stop` writes the marker; `start` clears it. `restart` writes no marker, so the check can recover a restart whose shutdown timed out.
+
+### Desktop: switch off and uninstall
+
+On the desktop build the plugin runs inside DeepSeek Harness, so switching it off is a marker plus a cold restart (C-26a):
+
+| Script | What it does |
+| --- | --- |
+| `scripts/superagent-off.ps1` | Writes `<stateDir>\.disabled`, which makes the plugin load nothing at all — no runtime, no sessions, no tickets — and removes start-up entries whose name names this installation (the `Run` key and the Startup folder). Deletes no data |
+| `scripts/superagent-on.ps1` | Clears the marker. Reopen DeepSeek Harness so the plugin loads again |
+| `scripts/superagent-uninstall.ps1` | Removes the marker, the start-up entries, and this plugin's loader entries from the profile's `cordis.patch.yml` (backed up beside it and checked afterwards). `-RemoveProgram -ProgramDir <dir>` also deletes the program directory. The state directory, ticket directories, sessions and delivered work stay (C-26) |
+
+The plugin reads `.disabled` before it mounts anything, so an installation switched off stays off even when DeepSeek Harness starts it. Close DeepSeek Harness before uninstalling, and open it again afterwards.
 
 ## Settings
 
@@ -202,7 +215,7 @@ The blocks:
 - `source:github`, `source:feishu`: `{"enabled": true, "config": {…}}`. GitHub's config has `repository` and `cli`, and the switches `observeIssues`, `observePulls`, `observeComments` and `observeCi`, off by default, which receive every new Issue, new pull request and comment in the repository and the default branch's CI; Feishu's has `cli`, `chats` as `[{"chatId": "oc_…", "name": "…", "listen": "mentions"}]` (or `"all"`), `directMessages`, and `otherChats` as `"none"` or `"mentions"`.
 - `policy`: `{"rules": […], "sources": {"github": {"allowed": [{"id": "<login>"}], "bots": [{"id": "dependabot[bot]"}]}, "feishu": {"allowed": [{"id": "ou_…", "name": "…"}], "syncChat": "oc_…", "admission": {"oc_…": {"unlistedAddressed": "explicit"}}}}}`. `bots` lists the bots whose messages may become inferred candidates. An `admission` row is keyed by chat id, `other` or `direct` for Feishu, and by `issues`, `pulls`, `comments` or `ci` for GitHub; an unset cell takes its default (see [002 Authorization](002-authorization.md)).
 - `eval`: `mode`, `timeoutSeconds` and `model`.
-- `executor`: `model`, `maxWorkers`, `directory`, `prepare` and `blockedCommands`. The processing pause is a setting of its own, `paused`, which `POST executor/pause` sets.
+- `executor`: `model`, `maxWorkers`, `directory`, `prepare`, `blockedCommands` and `budget`, which is `{"ticketsPerHour": 0, "ticketMinutes": 0, "dailyTokens": 0}` with each limit off at zero. The processing pause is a setting of its own, `paused`, which `POST executor/pause` sets.
 
 Changing a repository or CLI runs the corresponding setup check first. A failed check returns 400 with details in `setup`. A successful account change, or any save while setup is pending, returns `restarting: true`. The API is temporarily unavailable while the application restarts.
 

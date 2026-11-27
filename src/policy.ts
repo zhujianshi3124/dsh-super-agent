@@ -30,6 +30,8 @@ export function directionAllowed(value: unknown): value is AdmissionDirection {
 export interface Assessment {
   decision: 'accept' | 'ignore' | 'unavailable'; rule_assessments: RuleAssessment[]; direction: unknown
   title: string; scope: string; reason: string; intent_evidence?: string | null; acknowledgement?: string | null; worktree_name?: string
+  /** The confirmed instruction a ticket carries, and the number of the task within it (C-22). */
+  proposal?: string | null; task?: number | null
 }
 /**
  * Validate an assessment against enabled rules and convert it into an engine `AssessmentOutcome`.
@@ -46,10 +48,17 @@ export function assessmentOutcome(assessment: Assessment, settings: Pick<Setting
   }
   const matches = judged.filter(item => item.matched).map(({ rule_id, reason }) => ({ rule_id, reason }))
   const evidence = assessment.intent_evidence ? { intent_evidence: assessment.intent_evidence } : {}
-  const audit = { matches, rule_assessments: judged, direction: assessment.direction, ...evidence }
+  // Every ticket names the confirmed instruction and the task it carries, whatever entrance accepted it (C-22).
+  const carried = assessment.proposal ? { proposal: assessment.proposal, ...(assessment.task !== undefined && assessment.task !== null ? { task: assessment.task } : {}) } : {}
+  const audit = { matches, rule_assessments: judged, direction: assessment.direction, ...evidence, ...carried }
   if (assessment.decision !== 'accept') return { kind: assessment.decision, reason: assessment.reason, audit }
   if (!directionAllowed(assessment.direction)) return { kind: 'ignore', audit, reason: { code: 'directionUnsettled' } }
   if (!matches.length) return { kind: 'ignore', audit, reason: { code: 'noRuleMatched' } }
+  // A ticket under a confirmed instruction carries its task number, which is what keeps one task from becoming two tickets
+  // (C-09a). A ticket without any instruction is left to the gate, which refuses it with its own reason (C-22).
+  if (assessment.proposal && (assessment.task === undefined || assessment.task === null)) {
+    throw new Error('Acceptance under a confirmed instruction needs task: the number of the task within it that this ticket carries')
+  }
   if (!assessment.intent_evidence) throw new Error('Acceptance requires intent_evidence')
   const { title, scope, worktree_name: name } = assessment
   if (strength === 'inferred' && settings.eval.mode !== 'auto') {
@@ -87,13 +96,16 @@ export const EvalConfigSchema = z.object({
 }).strict()
 const CommandNameSchema = z.string().regex(/^[A-Za-z0-9._-]+$/).refine(name => name !== '.' && name !== '..', 'Not a command name')
   .refine(name => !WORKER_COMMANDS.includes(name), `${WORKER_COMMANDS.join(', ')} cannot be blocked`)
-/** Executor settings: worker model, concurrency, ticket directory root (empty defaults to `<stateDir>/work`), `prepare` command, and blocked commands. */
+/** Executor settings: worker model, concurrency, default directory (empty defaults to `D:/buzhiding`), `prepare` command,
+ * blocked commands, and the stuck-detection threshold in minutes (C-12b, C-37f). The foreman workspace is fixed at
+ * `D:/gongtou` (N-02) and is no longer a setting. */
 export const ExecutorConfigSchema = z.object({
   model: RoleModelSchema.nullable().default(null),
   maxWorkers: z.number().int().min(LIMITS.maxWorkers.min).max(LIMITS.maxWorkers.max).default(3),
-  directory: z.string().trim().refine(path => path === '' || path.startsWith('/'), 'An absolute path, or empty for <stateDir>/work').default(''),
+  directory: z.string().trim().refine(path => path === '' || path.startsWith('/') || /^[A-Za-z]:/.test(path), 'An absolute path, or empty for D:/buzhiding').default(''),
   prepare: z.string().max(LIMITS.prepareCommand).default(''),
   blockedCommands: z.array(CommandNameSchema).default([]),
+  stuckMinutes: z.number().int().min(LIMITS.stuckMinutes.min).max(LIMITS.stuckMinutes.max).default(60),
 }).strict()
 export const SourceInstanceSchema = z.object({ enabled: z.boolean().default(true), config: z.record(z.string(), z.unknown()).default({}) }).strict()
 export const SettingsSchema = z.object({
@@ -105,6 +117,23 @@ export const SettingsSchema = z.object({
 }).strict()
 export type Settings = z.infer<typeof SettingsSchema>
 export type SettingsBlock = 'policy' | 'eval' | 'executor' | `source:${string}`
+/**
+ * Settings a state directory written by an earlier version holds may carry keys this version dropped, such as
+ * `executor.foreman.enabled` and later the whole `executor.foreman` block (the foreman workspace is fixed, N-02).
+ * They are dropped here instead of failing the parse, so an existing installation opens and saves unchanged, and its
+ * history is left alone (C-26). A key this version never had still fails, so a typo stays visible.
+ */
+export function normalizeSettings(value: unknown): unknown {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return value
+  const settings = { ...(value as Record<string, unknown>) }
+  const executor = settings.executor
+  if (executor && typeof executor === 'object' && !Array.isArray(executor)) {
+    const { foreman: dropped, ...rest } = executor as Record<string, unknown>
+    void dropped
+    settings.executor = rest
+  }
+  return settings
+}
 export type SettingsSave = SettingsBlock | 'pause'
 export type SettingsOrigin = 'panel' | 'tool' | 'sync'
 

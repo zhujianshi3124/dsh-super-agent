@@ -59,6 +59,7 @@ Each Source's Policy has an admission table. Its rows are receiving scopes:
 
 - **Feishu:** each configured chat, other chats the bot receives mentions from, and direct messages. Other chats are received only when **其他群** is set to **仅 @** on the Feishu card.
 - **GitHub:** new Issues, new pull requests, comments and the default branch's CI.
+- **主会话 (the chief Source):** none. Every message the person writes in the main Session they opened is a direct message to the agent, so only the `allowed` list decides: the sender it names may originate work, and a message attributed to anyone else is refused with `not_a_member`. The host stores the list's default when an installation has none.
 
 A row has up to three cells. Each cell decides whether a message becomes an explicit request, an inferred candidate or nothing:
 

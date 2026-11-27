@@ -37,11 +37,10 @@ export class Intake extends EnginePart {
       thread.correlated = [...new Set([...thread.correlated, ...keys.filter(other => other !== thread.key)])]
       for (const ticketId of thread.subscriptions) {
         const ticket = this.repo.tickets.get(ticketId)
-        // Only a person's message on a non-context thread resumes an ended ticket; bots and CI do not (the Executor re-reads
-        // threads when it resumes), and a human-stopped ticket receives nothing because its Mandate was withdrawn.
+        // A ticket that ended stays ended and takes nothing, whichever sender wrote: a later message is assessed as new work,
+        // which a new ticket carries, and that new ticket may continue from the earlier one's result (C-11, N-13).
+        if (!ticket || !liveTicket(ticket)) continue
         const followed = !!thread.context?.includes(ticketId)
-        const resumes = trigger.human && ticket?.ended?.by !== 'human' && !followed
-        if (!ticket || (!liveTicket(ticket) && !resumes)) continue
         reached.set(ticketId, { ticket, context: followed && (reached.get(ticketId)?.context ?? true) })
       }
       this.repo.threads.save(thread)
@@ -53,10 +52,9 @@ export class Intake extends EnginePart {
     const fanout = [...reached.keys()], context = fanout.filter(id => reached.get(id)!.context)
     const disposition = { fanout, ...context.length ? { context } : {}, at }
     this.repo.triggers.saveDisposition(trigger.id, disposition)
-    // A person's message that no ticket decides, such as one that reached only tickets a person stopped or that follow the
-    // Thread for context, and every bot's, goes to Eval.
+    // A person's message that no open ticket decides — one that reached only ended tickets, tickets that follow the Thread
+    // for context, or none at all — and every bot's, goes to Eval, which is where work continuing an earlier ticket starts.
     if (!this.owners(trigger).length) this.queueForEval(trigger)
-    for (const ticketId of fanout) this.tickets.wake(ticketId)
     this.emit('trigger.received', { triggerId: trigger.id, threads: trigger.threads.map(threadKey) })
     return 'stored'
   }

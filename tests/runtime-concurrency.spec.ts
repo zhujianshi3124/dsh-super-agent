@@ -1,6 +1,6 @@
 /** Concurrent runtime behavior across overlapping triggers, deliveries, and worker launches. */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { latestAssignment, waitsForPerson, type Ticket, type Trigger } from '../src/core/index.ts'
+import { latestAssignment, type Ticket, type Trigger } from '../src/core/index.ts'
 import { Later } from '../src/app/effects.ts'
 import { reportRelay } from '../src/app/notices.ts'
 import { WorkerSlots, inputMessage, mandateInstructions, ticketExecution, transient, triggerMessage } from '../src/executor/dsh.ts'
@@ -81,49 +81,6 @@ it('drops a delivery whose ticket a person stopped while it waited for the worke
   expect(h.runtime.store.tickets.get(one.ticket.id)).not.toHaveProperty('delivery')
 })
 
-it('runs prepare commands in the background, side by side, while accepts, intake and passes go on', async () => {
-  const settings = h.runtime.store.settings()
-  h.runtime.store.saveSettings({ ...settings, executor: { ...settings.executor, prepare: 'git -C /srv/widgets worktree add "$DSH_SUPERAGENT_DIR"' } })
-  const prepare = deferred()
-  h.hooks.prepare = prepare.promise
-  const prepares = () => h.subprocess.spawn.mock.calls.filter(([spec]) => spec.argv[0] === 'sh').length
-  const first = [feishu('1', '@bot 修一'), feishu('2', '@bot 修二')]
-  for (const trigger of first) h.runtime.receive(trigger)
-  await h.runtime.idle()
-  for (const [index, trigger] of first.entries()) {
-    const accepted = await h.route({ kind: 'accept', trigger_id: trigger.id, title: 'fix', worktree_name: `fix-${index}`, acknowledgement: '收到。' })
-    expect(accepted).toMatchObject({ decision: 'accept', ticket: { state: 'working/queued' } })
-  }
-  await waitUntil(() => prepares() === 2)
-  // A Source loop's next message is stored at once, and a pass relays it while both prepare commands still run.
-  const later = feishu('3', '@bot 修三')
-  expect(h.runtime.receive(later)).toBe('stored')
-  await h.runtime.pump()
-  expect(h.candidates()).toEqual([...first, later].map(trigger => trigger.id))
-  prepare.resolve()
-  await h.runtime.idle()
-  expect(h.runtime.store.tickets.list().map(ticket => ticket.assignments.at(-1)!.state)).toEqual(['running', 'running'])
-})
-
-it('keeps a launch that a pause cut short queued, and finishes it once processing resumes', async () => {
-  const settings = h.runtime.store.settings()
-  h.runtime.store.saveSettings({ ...settings, executor: { ...settings.executor, prepare: 'make worktree' } })
-  const prepare = deferred()
-  h.hooks.prepare = prepare.promise
-  const trigger = feishu('1', '@bot 修一')
-  h.runtime.receive(trigger); await h.runtime.idle()
-  await h.route({ kind: 'accept', trigger_id: trigger.id, title: 'fix', worktree_name: 'fix-one', acknowledgement: '收到。' })
-  await waitUntil(() => h.subprocess.spawn.mock.calls.some(([spec]) => spec.argv[0] === 'sh'))
-  await h.runtime.settings.pause(true, 'panel')
-  prepare.resolve(); await h.runtime.idle()
-  const [ticket] = h.runtime.store.tickets.list()
-  expect(ticket!.assignments).toEqual([expect.objectContaining({ state: 'pending' })])
-  expect(h.runtime.effects.pending('launch')).toBe(true)
-  vi.useFakeTimers({ toFake: ['Date'], now: Date.now() + 6000 })
-  try { await h.runtime.settings.pause(false, 'panel'); await h.runtime.idle() } finally { vi.useRealTimers() }
-  expect(h.runtime.store.tickets.get(ticket!.id)!.assignments).toEqual([expect.objectContaining({ state: 'running' })])
-})
-
 const botMessage = () => feishu('2', 'CI 失败', { mentions: [], root_id: 'om_1', sender_id: 'cli_ci', sender_type: 'bot' })
 it('wakes an idle worker for a bot\'s Input only when a worker slot is free, and creates a worker Session someone deleted again', async () => {
   const settings = h.runtime.store.settings()
@@ -153,27 +110,6 @@ it('wakes an idle worker for a person\'s message at once, in the slot kept beyon
   h.runtime.receive(feishu('2', '一的补充', { mentions: [], root_id: 'om_1', sender_id: 'ou_guest' })); await h.runtime.idle()
   expect(h.runtime.store.tickets.get(one.ticket.id)!.undelivered).toEqual([])
   expect(h.agents.get(one.sessionId)!.status).toBe('running')
-})
-
-it('counts a launch under way against maxWorkers, so a bot\'s Input for an idle worker waits for the slot', async () => {
-  const settings = h.runtime.store.settings()
-  h.runtime.store.saveSettings({ ...settings, executor: { ...settings.executor, maxWorkers: 1, prepare: 'make worktree' } })
-  const one = await h.acceptedTicket(feishu('1', '@bot 修一'))
-  h.agents.get(one.sessionId)!.status = 'idle'
-  // Ticket two's launch holds the only slot while its prepare command runs, before its worker's Session does.
-  const prepare = deferred()
-  h.hooks.prepare = prepare.promise
-  h.runtime.receive(feishu('5', '@bot 修二')); await h.runtime.idle()
-  await h.route({ kind: 'accept', trigger_id: feishu('5', '').id, title: 'two', worktree_name: 'fix-two', acknowledgement: '收到。' })
-  await waitUntil(() => h.subprocess.spawn.mock.calls.filter(([spec]) => spec.argv[0] === 'sh').length === 2)
-  h.runtime.receive(botMessage()); await h.runtime.pump()
-  expect(h.runtime.store.tickets.get(one.ticket.id)!.undelivered).toHaveLength(1)
-  expect(h.agents.get(one.sessionId)!.status).toBe('idle')
-  prepare.resolve(); await h.runtime.idle()
-  const two = h.runtime.store.tickets.list().find(ticket => ticket.id !== one.ticket.id)!
-  expect(h.agents.get(`worker-${two.id}`)!.status).toBe('running')
-  // The slot is ticket two's now, so ticket one's Input still waits.
-  expect(h.runtime.store.tickets.get(one.ticket.id)!.undelivered).toHaveLength(1)
 })
 
 it('records on the ticket that its worker Session could not be created again', async () => {
@@ -255,12 +191,6 @@ describe('a worker that goes on after a passing failure', () => {
   })
 })
 describe('a worker whose work runs in the background', () => {
-  /** The worker's last words, as its Session holds them. */
-  const said = (sessionId: string, text: string) => {
-    (h.agents.get(sessionId) as unknown as { session: { snapshotEvents: () => unknown[] } }).session.snapshotEvents =
-      () => [{ type: 'assistant/message', data: { message: { content: [{ type: 'text', text }] } } }]
-  }
-  const minutes = (n: number) => vi.advanceTimersByTimeAsync(n * 60_000)
   it('stays busy while its shell job runs, holding its slot, and reports waiting once the job ended and its turn ends', async () => {
     const settings = h.runtime.store.settings()
     h.runtime.store.saveSettings({ ...settings, executor: { ...settings.executor, maxWorkers: 1 } })
@@ -304,22 +234,6 @@ describe('a worker whose work runs in the background', () => {
     // Its Session still admits subagents, as when the ticket resumes.
     expect(() => h.subagents.spawn(one.sessionId)).not.toThrow()
   })
-  it('reports waiting for the Assignment that replaced one whose idle still waited for its subagents', async () => {
-    const one = await h.acceptedTicket(feishu('1', '@bot 修一'))
-    const ticket = () => h.runtime.store.tickets.get(one.ticket.id)!
-    // The first Assignment's turn ends while a subagent of it works.
-    const child = h.subagents.spawn(one.sessionId)
-    idle(one.sessionId); await h.runtime.idle()
-    // Delivering a person's message fails, and a person retries: the subagent is released, and a second Assignment starts.
-    h.runtime.engine.deliveryFailed(one.ticket.id, latestAssignment(ticket())!.id, 'Session busy')
-    h.runtime.engine.retryTicket(one.ticket.id); await h.runtime.idle()
-    await vi.waitFor(() => expect(latestAssignment(ticket())).toMatchObject({ state: 'running' }))
-    expect(h.subagents.live(child)).toBe(false)
-    // The second Assignment's turn ends: it is reported waiting.
-    idle(one.sessionId)
-    await vi.waitFor(() => expect(latestAssignment(ticket())?.report?.state).toBe('waiting'))
-    expect(ticket().assignments).toHaveLength(2)
-  })
   /**
    * A worker that hands off to a person, with `report`, frees its slot and stops its subagents; its job, a server for the
    * person, runs on, and its end wakes no one.
@@ -329,7 +243,7 @@ describe('a worker whose work runs in the background', () => {
     before?.(one.ticket.id)
     const job = h.jobs.run(one.sessionId, 'pnpm dev'), child = h.subagents.spawn(one.sessionId)
     await h.runTool(one.sessionId, 'orchestrator_report', report); await h.runtime.idle()
-    const relayed = h.relays(h.runtime.masterId).length
+    const relayed = h.relays(h.runtime.rotation.foremanSession()).length
     idle(one.sessionId); await h.runtime.idle()
     // The subagent stops, and the turn its end woke is cancelled; the job's end is collected.
     await vi.waitFor(() => expect(h.subagents.live(child)).toBe(false))
@@ -345,26 +259,17 @@ describe('a worker whose work runs in the background', () => {
       content: [expect.objectContaining({ text: `Your background job ${job} (pnpm dev) ended: completed.` })] })))
     await h.runtime.idle()
     expect(h.runtime.executor.activeCount()).toBe(0)
-    expect(h.relays(h.runtime.masterId)).toHaveLength(relayed)
+    expect(h.relays(h.runtime.rotation.foremanSession())).toHaveLength(relayed)
     expect(latestAssignment(h.runtime.store.tickets.get(one.ticket.id)!)?.report).toMatchObject({ state: report.state })
     return one
   }
-  it('frees the slot of a worker that reports blocked, stopping its subagents and leaving its jobs, whose end wakes no one', async () => {
-    await handsOff({ state: 'blocked', summary: 'Which color?' })
-  })
-  it('keeps a failed worker from being woken by a job it left, and from failing again', async () => {
-    await handsOff({ state: 'failed', summary: 'The build broke.' })
-  })
-  it('frees the slot of a worker that reports ready on a ticket that follows its pull request', async () => {
-    await handsOff({ state: 'ready', summary: 'PR ready' }, ticketId => { h.runtime.engine.bindThread(ticketId, { source: 'github', id: '7' }, true) })
-  })
   it('frees the slot of a worker that asks a person a question with a progress report', async () => {
     await handsOff({ state: 'progress', summary: 'The server runs.', human_action: 'Does the button look right?' })
   })
   it('leaves the background work of a turn a person started in the worker\'s Session after a hand-off to that turn', async () => {
     const one = await h.acceptedTicket(feishu('1', '@bot 修一'))
     const agent = h.agents.get(one.sessionId)!
-    await h.runTool(one.sessionId, 'orchestrator_report', { state: 'blocked', summary: 'Which color?' }); await h.runtime.idle()
+    await h.runTool(one.sessionId, 'orchestrator_report', { state: 'progress', summary: 'The server runs.', human_action: 'Which color?' }); await h.runtime.idle()
     // A person answers in the worker's Session, which the ticket does not record; the turn starts a subagent and a job.
     await new Promise(resolve => setTimeout(resolve, 5))
     h.ctx.emit('agent/inbox/claimed', { agent, message: { id: 'typed', role: 'user', content: [], source: { kind: 'user' } }, turn: 2 } as never)
@@ -378,26 +283,9 @@ describe('a worker whose work runs in the background', () => {
     h.subagents.settle(child); h.jobs.end(job)
     expect(agent.status).toBe('running')
   })
-  it('leaves the jobs a worker left to a person out of a later turn\'s background work, and does not kill them at the limit', async () => {
-    const one = await handsOff({ state: 'ready', summary: 'PR ready' }, ticketId => { h.runtime.engine.bindThread(ticketId, { source: 'github', id: '7' }, true) })
-    const ticket = () => h.runtime.store.tickets.get(one.ticket.id)!
-    // A second server, left too; then a note from the orchestrator wakes the worker, whose turn ends without a report.
-    const server = h.jobs.run(one.sessionId, 'pnpm preview')
-    await h.runTool(one.sessionId, 'orchestrator_report', { state: 'ready', summary: 'Preview up' }); await h.runtime.idle()
-    idle(one.sessionId); await h.runtime.idle()
-    await vi.waitFor(() => expect(h.jobs.service.wait).toHaveBeenCalledWith(server, expect.any(Number), one.sessionId, expect.anything()))
-    await new Promise(resolve => setTimeout(resolve, 5))
-    h.runtime.engine.note(one.ticket.id, 'CI passed on the pull request.'); await h.runtime.idle()
-    await vi.waitFor(() => expect(h.agents.get(one.sessionId)!.status).toBe('running'))
-    idle(one.sessionId)
-    await vi.waitFor(() => expect(latestAssignment(ticket())?.report?.state).toBe('waiting'))
-    expect(h.jobs.service.kill).not.toHaveBeenCalled()
-    expect(h.runtime.executor.activeCount()).toBe(0)
-  })
-  it('records each end of a worker\'s turn on its Assignment, also after its ready report', async () => {
+  it('records each end of a worker\'s turn on its Assignment, also after its hand-off to a person', async () => {
     const one = await h.acceptedTicket(feishu('1', '@bot 修一'))
-    h.runtime.engine.bindThread(one.ticket.id, { source: 'github', id: '7' }, true)
-    await h.runTool(one.sessionId, 'orchestrator_report', { state: 'ready', summary: 'PR ready' }); await h.runtime.idle()
+    await h.runTool(one.sessionId, 'orchestrator_report', { state: 'progress', summary: 'The server runs.', human_action: 'Which color?' }); await h.runtime.idle()
     const report = latestAssignment(h.runtime.store.tickets.get(one.ticket.id)!)!.report!
     await new Promise(resolve => setTimeout(resolve, 5))
     idle(one.sessionId); await h.runtime.idle()
@@ -410,121 +298,6 @@ describe('a worker whose work runs in the background', () => {
     await h.runTool(one.sessionId, 'orchestrator_report', { state: 'progress', summary: 'On it again' })
     const page = await h.api('GET', `tickets/${one.ticket.id}`)
     expect((page.body as { assignments: Record<string, unknown>[] }).assignments[0]).not.toHaveProperty('turnEndedAt')
-  })
-  it('keeps a ticket open at a merge while its worker does in the background a message it acknowledged', async () => {
-    const one = await h.acceptedTicket(feishu('1', '@bot 修一'))
-    const ticket = () => h.runtime.store.tickets.get(one.ticket.id)!
-    h.runtime.engine.bindThread(one.ticket.id, { source: 'github', id: '7' }, true)
-    await h.runTool(one.sessionId, 'orchestrator_report', { state: 'ready', summary: 'PR ready' }); await h.runtime.idle()
-    idle(one.sessionId); await h.runtime.idle()
-    // A person asks for more; the worker acknowledges it, starts the work in the background and its turn ends.
-    await new Promise(resolve => setTimeout(resolve, 5))
-    const more = feishu('2', '再加个测试', { mentions: [], root_id: 'om_1' })
-    h.runtime.receive(more); await h.runtime.idle()
-    await vi.waitFor(() => expect(ticket().undelivered).toEqual([]))
-    await h.runTool(one.sessionId, 'orchestrator_ack', { trigger_id: more.id, text: '收到' })
-    h.jobs.run(one.sessionId)
-    idle(one.sessionId); await h.runtime.idle()
-    h.runtime.engine.threadClosed({ source: 'github', id: '7' }, 'merged', new Date().toISOString())
-    expect(ticket().ended).toBeUndefined()
-    expect(h.jobs.service.kill).not.toHaveBeenCalled()
-  })
-  it('keeps a worker busy with what it started after a message reached its ready ticket', async () => {
-    const one = await h.acceptedTicket(feishu('1', '@bot 修一'))
-    const ticket = () => h.runtime.store.tickets.get(one.ticket.id)!
-    // The ticket follows its pull request, so a ready report leaves it open.
-    h.runtime.engine.bindThread(one.ticket.id, { source: 'github', id: '7' }, true)
-    await h.runTool(one.sessionId, 'orchestrator_report', { state: 'ready', summary: 'PR ready' })
-    idle(one.sessionId); await h.runtime.idle()
-    expect(h.runtime.executor.activeCount()).toBe(0)
-    // A person asks for more; the worker starts the tests in the background and ends its turn.
-    await new Promise(resolve => setTimeout(resolve, 5))
-    h.runtime.receive(feishu('2', '再加个测试', { mentions: [], root_id: 'om_1' })); await h.runtime.idle()
-    await vi.waitFor(() => expect(latestAssignment(ticket())?.deliveredAt! >= latestAssignment(ticket())!.report!.at).toBe(true))
-    const job = h.jobs.run(one.sessionId)
-    idle(one.sessionId); await h.runtime.idle()
-    await new Promise(resolve => setTimeout(resolve, 10))
-    expect(h.jobs.service.kill).not.toHaveBeenCalled()
-    expect(h.runtime.executor.activeCount()).toBe(1)
-    h.jobs.end(job); idle(one.sessionId)
-    await vi.waitFor(() => expect(latestAssignment(ticket())?.report?.state).toBe('waiting'))
-  })
-  it('gives each idle of a worker its own 30 minutes, not counting the turns that ends of its background work wake it for', async () => {
-    const one = await h.acceptedTicket(feishu('1', '@bot 修一'))
-    const ticket = () => h.runtime.store.tickets.get(one.ticket.id)!
-    const first = h.jobs.run(one.sessionId)
-    let second = ''
-    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
-    try {
-      idle(one.sessionId)
-      await minutes(20)
-      // The job ends and wakes the worker, which starts another and ends its turn 5 minutes later.
-      h.jobs.end(first)
-      second = h.jobs.run(one.sessionId)
-      await minutes(5)
-      idle(one.sessionId)
-      // 35 minutes after the first idle, 10 after the second.
-      await minutes(10)
-      expect(h.jobs.service.kill).not.toHaveBeenCalled()
-      expect(latestAssignment(ticket())?.report).toBeUndefined()
-      await minutes(20)
-    } finally { vi.useRealTimers() }
-    await vi.waitFor(() => expect(h.jobs.service.kill).toHaveBeenCalledWith(second, one.sessionId, expect.any(String)))
-    expect(latestAssignment(ticket())?.report?.state).toBe('waiting')
-  })
-  it('kills the jobs that run 30 minutes after the turn ended, leaving its subagents, and reports waiting after the worker\'s words', async () => {
-    const one = await h.acceptedTicket(feishu('1', '@bot 修一'))
-    const ticket = () => h.runtime.store.tickets.get(one.ticket.id)!
-    said(one.sessionId, 'The tests run in the background.')
-    const job = h.jobs.run(one.sessionId, 'pnpm test\n  --watch=false'), child = h.subagents.spawn(one.sessionId)
-    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
-    try {
-      idle(one.sessionId)
-      await minutes(29)
-      expect(latestAssignment(ticket())?.report).toBeUndefined()
-      await minutes(1)
-    } finally { vi.useRealTimers() }
-    await vi.waitFor(() => expect(latestAssignment(ticket())?.report).toMatchObject({ state: 'waiting', summary: 'The tests run in the background.\n\n'
-      + `Background jobs ran 30 minutes after the worker's turn ended and were killed: ${job} (pnpm test).` }))
-    expect(h.jobs.service.kill).toHaveBeenCalledWith(job, one.sessionId, expect.any(String))
-    // The kill was collected, so the worker reads of it at its next turn.
-    expect(h.agents.get(one.sessionId)!.inject).toHaveBeenCalledWith(expect.objectContaining({ content: [expect.objectContaining({
-      text: `Your background jobs ran 30 minutes after your turn ended and were killed: ${job} (pnpm test).` })] }))
-    // Stopping its subagent would wake it with the end, in the Assignment it was just reported waiting in.
-    expect(h.subagents.live(child)).toBe(true)
-    expect(h.relays(h.runtime.masterId).at(-1)).toMatchObject({ kind: 'worker_report', state: 'waiting' })
-  })
-  it('says a worker\'s subagents still run when only they ran 30 minutes after the turn ended', async () => {
-    const one = await h.acceptedTicket(feishu('1', '@bot 修一'))
-    h.subagents.spawn(one.sessionId)
-    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
-    try { idle(one.sessionId); await minutes(30) } finally { vi.useRealTimers() }
-    await vi.waitFor(() => expect(latestAssignment(h.runtime.store.tickets.get(one.ticket.id)!)?.report).toMatchObject({ state: 'waiting',
-      summary: 'Subagents still ran 30 minutes after the worker\'s turn ended.' }))
-  })
-  it('holds a delivery that reached a worker while a hand-off stopped its subagents until the stop ended', async () => {
-    const one = await h.acceptedTicket(feishu('1', '@bot 修一'))
-    const agent = h.agents.get(one.sessionId)!
-    h.runtime.engine.bindThread(one.ticket.id, { source: 'github', id: '7' }, true)
-    h.subagents.spawn(one.sessionId)
-    await h.runTool(one.sessionId, 'orchestrator_report', { state: 'ready', summary: 'PR ready' }); await h.runtime.idle()
-    // A person's message is on its way into the worker's Session, held there, as the worker hands off; the release is slow.
-    const session = deferred(), drain = deferred(), release = h.subagents.service.drainChildren.getMockImplementation()!
-    h.subagents.service.drainChildren.mockImplementationOnce(async (parent, ids) => { await drain.promise; await release(parent, ids) })
-    await new Promise(resolve => setTimeout(resolve, 5))
-    const held = holdSession(one.sessionId, session.promise)
-    h.runtime.receive(feishu('2', '按钮再大一点', { mentions: [], root_id: 'om_1' }))
-    await vi.waitFor(() => expect(held()).toBe(true))
-    idle(one.sessionId)
-    await vi.waitFor(() => expect(h.subagents.service.drainChildren).toHaveBeenCalled())
-    session.resolve()
-    await new Promise(resolve => setTimeout(resolve, 20))
-    drain.resolve()
-    // The message reaches the worker after the stop's cancel, which would have dropped it.
-    const message = expect.objectContaining({ sessionId: one.sessionId, text: expect.stringContaining('按钮再大一点') })
-    await vi.waitFor(() => expect(h.deliveries).toHaveBeenCalledWith(message), { timeout: 5000 })
-    const delivered = h.deliveries.mock.calls.findIndex(([call]) => call.sessionId === one.sessionId && call.text.includes('按钮再大一点'))
-    expect(h.deliveries.mock.invocationCallOrder[delivered]).toBeGreaterThan(agent.cancel.mock.invocationCallOrder.at(-1)!)
   })
   it('keeps an Input a restart found handed over to a settled worker, and delivers a waiting one once its subagents stopped', async () => {
     const one = await h.acceptedTicket(feishu('1', '@bot 修一'))
@@ -545,7 +318,7 @@ describe('a worker whose work runs in the background', () => {
     await new Promise(resolve => setTimeout(resolve, 20))
     const late = expect.objectContaining({ sessionId: one.sessionId, text: expect.stringContaining('One more thing') })
     expect(h.deliveries).not.toHaveBeenCalledWith(late)
-    const reports = () => h.relays(h.runtime.masterId).filter(item => item.kind === 'worker_report').length
+    const reports = () => h.relays(h.runtime.rotation.foremanSession()).filter(item => item.kind === 'worker_report').length
     const reported = reports()
     gate.resolve()
     await vi.waitFor(() => expect(h.deliveries).toHaveBeenCalledWith(late))
@@ -556,10 +329,10 @@ describe('a worker whose work runs in the background', () => {
     expect(reports()).toBe(reported)
   })
   it('collects the end of a job left to a person until dsh-superagent stopped its workers', async () => {
-    const one = await handsOff({ state: 'blocked', summary: 'Which color?' })
+    const one = await handsOff({ state: 'progress', summary: 'The server runs.', human_action: 'Which color?' })
     const agent = h.agents.get(one.sessionId)!
     const server = h.jobs.run(one.sessionId, 'pnpm dev')
-    await h.runTool(one.sessionId, 'orchestrator_report', { state: 'blocked', summary: 'Which size?' }); await h.runtime.idle()
+    await h.runTool(one.sessionId, 'orchestrator_report', { state: 'progress', summary: 'Still running.', human_action: 'Which size?' }); await h.runtime.idle()
     idle(one.sessionId)
     await vi.waitFor(() => expect(h.jobs.service.wait).toHaveBeenCalledWith(server, expect.any(Number), one.sessionId, expect.anything()))
     // The server ends while the host stops, after it cancelled the workers.
@@ -629,44 +402,6 @@ describe('a worker whose work runs in the background', () => {
 })
 describe('what a worker read', () => {
   const later = () => new Promise(resolve => setTimeout(resolve, 5))
-  /** A ticket its worker completed, and a person's thanks on its thread, which resumes it once received. */
-  async function completed() {
-    const one = await h.acceptedTicket(feishu('1', '@bot 修一'))
-    await h.runTool(one.sessionId, 'orchestrator_report', { state: 'ready', summary: 'Done' }); await h.runtime.idle()
-    idle(one.sessionId)
-    await later()
-    return { one, thanks: feishu('2', '@bot 谢谢', { root_id: 'om_1' }), ticket: () => h.runtime.store.tickets.get(one.ticket.id)! }
-  }
-  /** Deliveries to a Session of a message with `text` fail until the returned function lets them through. */
-  function failing(sessionId: string, text: string) {
-    const agent = h.agents.get(sessionId)!, steer = agent.steer.getMockImplementation()!
-    let fail = true
-    agent.steer.mockImplementation(message => {
-      if (fail && message.content.some(block => block.type === 'text' && block.text.includes(text))) throw new Error('Session busy')
-      steer(message)
-    })
-    return () => { fail = false }
-  }
-  /** Runs `then` after the delivery retry, two seconds on; the clock moves on only by `vi.setSystemTime`. */
-  async function retried(then: () => Promise<void>) {
-    vi.useFakeTimers({ toFake: ['Date'], now: Date.now() + 2000 })
-    try { await h.runtime.pump(); await h.runtime.idle(); await then(); await h.runtime.pump(); await h.runtime.idle() }
-    finally { vi.useRealTimers() }
-  }
-  it('sends to Eval a message that woke a ticket and that a retry delivered after a progress report, at a dropped report', async () => {
-    const { one, thanks, ticket } = await completed()
-    const pass = failing(one.sessionId, '谢谢')
-    h.runtime.receive(thanks); await h.runtime.idle()
-    expect(ticket().delivery).toBeDefined()
-    await h.runTool(one.sessionId, 'orchestrator_report', { state: 'progress', summary: 'Looking' })
-    pass()
-    // The retry steers the message in while the worker writes that nothing is left, and no step takes it before.
-    await retried(async () => {
-      expect(ticket().undelivered).toEqual([])
-      await h.runTool(one.sessionId, 'orchestrator_report', { state: 'dropped', summary: 'Nothing to do' })
-    })
-    expect(h.candidates()).toContain(thanks.id)
-  })
   it('counts a delivered message as read only once its step took it into the Session, not when a cut-off step claimed it', async () => {
     const one = await h.acceptedTicket(feishu('1', '@bot 修一'))
     const more = feishu('2', '再改一下', { mentions: [], root_id: 'om_1' })
@@ -719,60 +454,18 @@ describe('what a worker read', () => {
     await h.runtime.idle(); await later()
     expect(sent()).toBe(2)
   })
-  it('counts a message that woke a ticket as read by a later dropped report once a step of its worker took it', async () => {
-    const { one, thanks } = await completed()
-    // The resumed Assignment's message wakes the worker; its next step takes the note that it resumed and the message.
-    h.runtime.receive(thanks); await h.runtime.idle()
-    h.step(one.sessionId)
-    await later()
-    await h.runTool(one.sessionId, 'orchestrator_report', { state: 'dropped', summary: 'Nothing to do' })
-    await h.runtime.pump(); await h.runtime.idle()
-    expect(h.candidates()).not.toContain(thanks.id)
-  })
-  it('counts a message a retry delivered to its idle worker as read by the report of the turn it woke', async () => {
-    const { one, thanks, ticket } = await completed()
-    const pass = failing(one.sessionId, '谢谢')
-    h.runtime.receive(thanks); await h.runtime.idle()
-    idle(one.sessionId)
-    await vi.waitFor(() => expect(latestAssignment(ticket())?.report?.state).toBe('waiting'))
-    pass()
-    // The retry wakes the worker, whose first step takes the message.
-    await retried(async () => {
-      expect(h.agents.get(one.sessionId)!.status).toBe('running')
-      vi.setSystemTime(Date.now() + 1000)
-      await h.runTool(one.sessionId, 'orchestrator_report', { state: 'dropped', summary: 'Nothing to do' })
-    })
-    expect(h.candidates()).not.toContain(thanks.id)
-  })
-  it('sends to Eval at a merge a message that reached the worker after its last step, which no step took before its turn ended', async () => {
-    const one = await h.acceptedTicket(feishu('1', '@bot 修一'))
-    const ticket = () => h.runtime.store.tickets.get(one.ticket.id)!
-    h.runtime.engine.bindThread(one.ticket.id, { source: 'github', id: '7' }, true)
-    await h.runTool(one.sessionId, 'orchestrator_report', { state: 'ready', summary: 'PR ready' }); await h.runtime.idle()
-    // A person's thanks reaches the worker after the step of its report, and its turn ends with no step taking it.
-    await later()
-    const thanks = feishu('2', '@bot 谢谢', { root_id: 'om_1' })
-    h.runtime.receive(thanks); await h.runtime.idle()
-    idle(one.sessionId)
-    await vi.waitFor(() => expect(latestAssignment(ticket())?.report?.state).toBe('waiting'))
-    await later()
-    h.runtime.engine.threadClosed({ source: 'github', id: '7' }, 'merged', new Date().toISOString())
-    await h.runtime.pump(); await h.runtime.idle()
-    expect(ticket().ended).toMatchObject({ outcome: 'merged' })
-    expect(h.candidates()).toContain(thanks.id)
-  })
 })
 it('reports nothing for a worker whose turn ends while it waits out the backoff of a passing failure', async () => {
   const one = await h.acceptedTicket(feishu('1', '@bot 修一'))
   const agent = h.agents.get(one.sessionId)!
-  const relayed = h.relays(h.runtime.masterId).length
+  const relayed = h.relays(h.runtime.rotation.foremanSession()).length
   h.ctx.emit('agent/error', { agent, turn: 1, step: 1, error: Object.assign(new Error('Service Unavailable'), { status: 503 }) } as never)
   agent.status = 'idle'
   h.ctx.emit('agent/status', { agent, status: 'idle' } as never)
   await h.runtime.idle()
   await new Promise(resolve => setTimeout(resolve, 20))
   expect(latestAssignment(h.runtime.store.tickets.get(one.ticket.id)!)?.report).toBeUndefined()
-  expect(h.relays(h.runtime.masterId)).toHaveLength(relayed)
+  expect(h.relays(h.runtime.rotation.foremanSession())).toHaveLength(relayed)
 })
 it('wakes an idle worker for a status request in the slot kept for a person, while every other slot is taken', async () => {
   const settings = h.runtime.store.settings()
@@ -797,20 +490,7 @@ it('tells a passing failure of the provider or the network from one that a later
     expect(transient(error)).toBe(false)
   }
 })
-it('reports a worker waiting when its turn ends after a person answered its blocked report', async () => {
-  const one = await h.acceptedTicket(feishu('1', '@bot 修一'))
-  await h.runTool(one.sessionId, 'orchestrator_report', { state: 'blocked', summary: 'Which color?' })
-  // The person answers later than the report.
-  await new Promise(resolve => setTimeout(resolve, 5))
-  h.runtime.receive(feishu('2', '蓝色', { mentions: [], root_id: 'om_1' })); await h.runtime.idle()
-  const ticket = () => h.runtime.store.tickets.get(one.ticket.id)!
-  expect(waitsForPerson(ticket())).toBe(false)
-  h.agents.get(one.sessionId)!.status = 'idle'
-  h.ctx.emit('agent/status', { agent: h.agents.get(one.sessionId), status: 'idle' } as never)
-  await vi.waitFor(() => expect(latestAssignment(ticket())?.report?.state).toBe('waiting'))
-})
-
-it('resumes an ended ticket a person wrote to during a pause once it lifts, under the Policy then', async () => {
+it('sends a message a person wrote to an ended ticket during a pause to Eval once it lifts, under the Policy then', async () => {
   const pass = async () => {
     vi.useFakeTimers({ toFake: ['Date'], now: Date.now() + 6000 })
     try { await h.runtime.pump(); await h.runtime.idle() } finally { vi.useRealTimers() }
@@ -825,18 +505,21 @@ it('resumes an ended ticket a person wrote to during a pause once it lifts, unde
     await h.runtime.settings.pause(true, 'panel')
     h.runtime.receive(feishu(id, '再改一下', { mentions: [], root_id: root })); await h.runtime.idle()
   }
-  // While processing is paused, the message waits on the ended ticket; the first pass after the pause resumes it.
+  // While processing is paused, the message waits on the Thread, not on the ended ticket.
   await followUp('2', 'om_1')
-  expect(h.runtime.store.tickets.get(first)).toMatchObject({ ended: expect.anything(), undelivered: [expect.any(String)] })
+  expect(h.runtime.store.tickets.get(first)).toMatchObject({ ended: expect.anything(), undelivered: [] })
   await h.runtime.settings.pause(false, 'panel'); await pass()
-  expect(h.runtime.store.tickets.get(first)).toMatchObject({ assignments: [expect.anything(), expect.objectContaining({ state: 'running' })] })
-  expect(h.runtime.store.tickets.get(first)).not.toHaveProperty('ended')
-  // A Mandate the Policy no longer holds when the pause lifts does not resume: its sender left the list meanwhile.
+  expect(h.runtime.store.tickets.get(first)!.ended).toBeDefined()
+  expect(h.runtime.store.tickets.get(first)!.assignments).toHaveLength(1)
+  const thread = h.runtime.store.threads.get(`feishu:${CHAT}:om_1`)!
+  expect(thread.evaluating ?? thread.pending.includes('2')).toBeTruthy()
+  // A Mandate the Policy no longer holds when the pause lifts does not admit it: its sender left the list meanwhile.
   await followUp('4', 'om_3')
   const settings = h.runtime.store.settings()
   h.runtime.store.saveSettings({ ...settings, policy: { ...settings.policy, sources: { ...settings.policy.sources, feishu: { ...settings.policy.sources.feishu!, allowed: [] } } } })
   await h.runtime.settings.pause(false, 'panel'); await pass()
   expect(h.runtime.store.tickets.get(second)).toMatchObject({ ended: expect.anything(), undelivered: [] })
+  expect(h.candidates()).not.toContain('4')
 })
 
 it('ends a worker\'s turn only when the stop that ended its Assignment commits', async () => {
@@ -924,7 +607,7 @@ describe('the Executor\'s parts', () => {
     expect(changed).not.toContain('person')
     expect(changed).not.toContain('v2')
     const mode = inputMessage({ id: 'i6', kind: 'policy-changed', at: '', from: 'v1', to: 'v2', effect: { proactive: false } })!
-    expect(mode).toContain('Work inferred from a rule is no longer accepted, as the accept mode is no longer auto')
+    expect(mode).toContain('Work inferred from a rule is no longer accepted: finish only what is in progress within the assignment, and take on nothing new.')
     expect(mode).not.toContain('sender')
     expect(inputMessage({ id: 'i5', kind: 'resumed', at: '', triggerId: 'tr2' })).not.toContain('tr2')
     expect(inputMessage({ id: 'i4', kind: 'reopen', at: '' } as never)).toBeUndefined()

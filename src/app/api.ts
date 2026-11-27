@@ -1,43 +1,40 @@
 /** Type-only management API contract between the web panel and host routes, imported by the panel without bundling host code. */
+import type { WrapUpView } from './wrapup.ts'
 import type { ModelCatalog } from '@deepseek-ai/dsh-api-session-controller/types'
 import type { PromptConfig, Prompts } from './prompts.ts'
-import type { PromptsView, StateView, TicketPageView } from './http.ts'
+import type { PromptsView, ProposalPageView, StateView, TicketPageView } from './http.ts'
 import type { HistoryView } from './settings-history.ts'
 import type { OverviewView } from './views/overview.ts'
 import type { SettingsView } from './views/settings.ts'
-import type { SourceStatusView } from './views/sources.ts'
-import type { DecisionListView, SearchView, ThreadDetailView, ThreadListView } from './views/threads.ts'
+import type { SearchView } from './views/threads.ts'
 import type { TicketListView } from './views/tickets.ts'
 
-export const TICKET_FILTERS = ['open', 'person', 'working', 'idle', 'ended'] as const
-export const THREAD_FILTERS = ['subscribed', 'evaluating', 'recent', 'all'] as const
+/** The execution page's three filters (C-37d): working, stopped, all. */
+export const TICKET_FILTERS = ['working', 'ended', 'all'] as const
 export type TicketFilter = typeof TICKET_FILTERS[number]
-export type ThreadFilter = typeof THREAD_FILTERS[number]
 interface Paged { offset?: number; limit?: number }
 /** Whether a context update was already injected into the main Session or is still pending delivery. */
 type Delivery = 'injected' | 'pending'
 
+/**
+ * The panel's operations (C-38 is exhaustive): stop a ticket, open a session (client-side), pause or resume dispatch, wrap up or start work (C-17b),
+ * change the execution/prompts/deployment settings, search and read history, and collapse seen problems (client-side).
+ * There is no retry, no requeue, no dismiss, no unsubscribe, no master designation (C-39).
+ */
 export interface Api {
   'GET state': { response: StateView }
   'GET overview': { response: OverviewView }
   'GET search': { query: { q: string }; response: SearchView }
-  'GET sources': { response: SourceStatusView[] }
   'GET settings': { response: SettingsView }
-  'POST sources/:id/labels': { response: { added: string[] } }
-  'GET threads': { query?: Paged & { filter?: ThreadFilter }; response: ThreadListView }
-  'GET threads/:key': { query?: { limit?: number; before?: string; around?: string }; response: ThreadDetailView }
-  'POST threads/:key/unsubscribe': { response: { removed: boolean; thread: string; context_delivery: Delivery } }
-  'POST triggers/:id/requeue': { response: { queued: boolean } }
-  'GET decisions': { query?: Paged & { kind?: string; window?: '24h' }; response: DecisionListView }
-  'POST decisions/:id/dismiss': { response: { dismissed: true } }
   'GET tickets': { query?: Paged & { state?: TicketFilter }; response: TicketListView }
   'GET tickets/:id': { response: TicketPageView }
-  'POST tickets/:id/retry': { response: { retried: true } }
+  'GET proposals/:id': { response: ProposalPageView }
   'POST tickets/:id/stop': { response: { stopped: true } }
   'POST executor/pause': { body: { paused: boolean }; response: { paused: boolean } }
+  'POST executor/wrapup': { response: WrapUpView }
+  'POST executor/startwork': { response: WrapUpView }
   'PUT settings/:block': { body: { value: unknown; revision: number }; response: { revision: number; restarting: boolean } }
-  'GET policy/history': { response: HistoryView }
-  'POST policy-sync/:id': { response: { policy: unknown } }
+  'GET settings/history': { response: HistoryView }
   'POST setup/check': { response: { restarting: true } }
   'GET models': { response: ModelCatalog }
   'GET prompts': { query?: { revision?: number; offset?: number }; response: PromptsView }

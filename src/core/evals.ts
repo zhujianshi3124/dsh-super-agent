@@ -1,5 +1,5 @@
 /** Evals: the Thread-level assessments of queued Triggers, and the Decisions they end with. */
-import { key } from './ids.ts'
+import { continuationTicketId, key, taskTicketId } from './ids.ts'
 import { UserError } from './errors.ts'
 import { liveTicket, threadKey } from './model.ts'
 import type { Decision, DecisionKind, Evaluation, Mandate, MandateBasis, Strength, Thread, Trigger } from './model.ts'
@@ -133,8 +133,27 @@ export class Evals extends EnginePart {
     if (!trigger) throw new UserError('unknownTrigger')
     const held = this.holding(triggerId)
     if (outcome.evalId && held?.evaluating?.id !== outcome.evalId) throw new UserError('evalFinished', { eval: outcome.evalId })
-    // Prevent a replayed trigger that already created a ticket from spawning a second one.
-    const earlier = outcome.kind === 'accept' ? this.accepted(threadKey(trigger.threads[0]!)).get(triggerId) : undefined
+    // One task of a confirmed instruction has one live ticket at a time: a second accept while it lives is refused (C-09).
+    // Once every ticket of that task stopped, the task may be continued by a NEW ticket under the same instruction (N-13a):
+    // the continuation carries `continues` and a new number, and the old ticket stays stopped (C-11).
+    const audit = outcome.kind === 'accept' ? outcome.audit : undefined
+    const claimed = typeof audit?.proposal === 'string' ? audit.proposal : undefined
+    const taskNumber = typeof audit?.task === 'number' ? audit.task : undefined
+    let dispatched: string | undefined
+    if (claimed !== undefined && taskNumber !== undefined) {
+      const base = taskTicketId(claimed, taskNumber)
+      const prior = this.repo.tickets.list().filter(ticket => ticket.id === base || (ticket.proposal === claimed && ticket.task === taskNumber))
+      const live = prior.find(liveTicket)
+      if (live) throw new UserError('taskDispatched', { ticket: live.id })
+      if (prior.length) {
+        const latest = prior.sort((a, b) => a.createdAt.localeCompare(b.createdAt)).at(-1)!
+        outcome = { ...outcome, audit: { ...audit, continues: latest.id, round: prior.length } } as Outcome
+        dispatched = base
+      }
+    }
+    // Prevent a replayed trigger that already created a ticket from spawning a second one. A task-based accept is keyed by its
+    // task above, so the same message may carry several tickets of one instruction.
+    const earlier = outcome.kind === 'accept' && !dispatched ? this.accepted(threadKey(trigger.threads[0]!)).get(triggerId) : undefined
     if (earlier) {
       // Only an Eval started by an earlier version can still hold it; reassess the remaining triggers without it, or ignore it if alone.
       const others = held?.evaluating?.triggerIds.filter(id => id !== triggerId) ?? []
@@ -297,7 +316,7 @@ export class Evals extends EnginePart {
       if (evaluation.strength !== 'explicit') return this.finish(thread, evaluation, { kind: 'ignore',
         reason: [{ code: 'stopNotExplicit' }], ...audit })
       const decision = this.finish(thread, evaluation, { kind: 'stop', reason: reasonOf(outcome.reason), ticketId: ticket.id, ...audit })
-      this.tickets.end(ticket.id, 'human', 'stopped', this.now(), typeof outcome.reason === 'string' ? outcome.reason : undefined)
+      this.tickets.end(ticket.id, 'human', 'stopped', this.now(), typeof outcome.reason === 'string' ? outcome.reason : undefined, 'user-stopped')
       return decision
     }
     return this.accept(thread, evaluation, outcome)
@@ -308,7 +327,12 @@ export class Evals extends EnginePart {
     const basis = { ...evaluation.basis, ...(outcome.rules ? { rules: outcome.rules } : {}) }
     const { strength, policyVersion, actor } = evaluation
     const mandate: Mandate = { strength, policyVersion, basis, actor, scope: outcome.scope }
-    const ticketId = key('ticket', evaluation.id)
+    const proposalId = typeof outcome.audit?.proposal === 'string' ? outcome.audit.proposal : undefined
+    const task = typeof outcome.audit?.task === 'number' ? outcome.audit.task : undefined
+    const round = typeof outcome.audit?.round === 'number' ? outcome.audit.round : 0
+    const ticketId = proposalId && task !== undefined
+      ? (round ? continuationTicketId(proposalId, task, round) : taskTicketId(proposalId, task))
+      : key('ticket', evaluation.id)
     const audit = outcome.audit ? { audit: outcome.audit } : {}
     const decision = this.finish(thread, evaluation, { kind: 'accept', reason: reasonOf(outcome.reason), ...audit, mandate, ticketId })
     this.tickets.create(ticketId, decision.id, mandate, evaluation, outcome, at)

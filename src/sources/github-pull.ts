@@ -75,7 +75,7 @@ function bind(ctx: SourceContext, ticketId: string, pr: Pull, own: boolean): voi
 }
 /**
  * Reports a merged or closed PR once to the open tickets that follow it, whose end the core decides.
- * Their subscription to the PR stays so a later human comment there resumes the ticket.
+ * Their subscription to the PR stays, and a later human comment there is new work, not a wake of the ended ticket (C-11).
  */
 function closePull(ctx: SourceContext, pr: Pull): void {
   if (!ctx.tickets.open().some(ticket => pullsOf(ticket, true).includes(pr.number))) return

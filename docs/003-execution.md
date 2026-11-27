@@ -22,11 +22,17 @@ An `idle` Ticket has finished its turn without an outstanding question. A Trigge
 
 ## The Executor
 
-Each Ticket gets an Executor Session named `worker-<ticket id>` and a directory named after the Ticket's short name. Directories are created under the configured execution root, which defaults to `<stateDir>/work`.
+Each Ticket gets an Executor Session named `worker-<ticket id>` and a directory named after the Ticket's short name. Directories are created under the configured execution root, which defaults to `D:/buzhiding`; a state directory under the OS temporary directory, as every test run has, keeps them in its own `work` folder instead.
+
+Every Executor Session shares that root as its workspace: a Session's current directory is its workspace's path, so a workspace per ticket would add a workspace per ticket to the sidebar. The worker works in its own directory instead, which `DSH_SUPERAGENT_DIR` names, and its prompt restricts every change to it.
 
 Executor Sessions run commands without approval as the operator's OS user. Their `dsh-superagent-worker` preset contains the tools needed for work and moves foreground shell commands to background jobs after 5 seconds. This lets a worker receive new messages at the next step instead of waiting for a long command to finish.
 
 The main Session uses `dsh-superagent-router`, with the same 5-second shell and job-wait limits and a smaller tool set for routing. Sessions retain the preset selected at creation. Worker subagents use DeepSeek Harness's `standard` preset.
+
+### The budget
+
+Three limits bound what an installation may spend; each is off at zero, and the Execution settings hold them. A new ticket is refused once the last hour made as many as the limit allows, and the refusal names the count. A launch waits while the day's model tokens, counted by the person's local day over every managed Session, reached their limit. An Assignment that runs past its minutes is stopped, and so is any Assignment once the day's tokens are spent: the stop is a `blocked` Report that hands the Ticket back to a person, and the worker's Session keeps its inbox. The Executor checks the limits on the pass heartbeat, so a runaway Assignment ends within seconds rather than at its next turn. A limit never loosens itself: raising one, or waiting for the next hour or day, is the person's decision.
 
 ### Background work and worker slots
 

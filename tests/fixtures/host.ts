@@ -2,6 +2,7 @@
  * In-memory DSH host fixture (as in tests/runtime.spec.ts) running a configured Runtime with GitHub and Feishu sources,
  * allowed member Alice (`ou_alice`), listened chat `oc_team`, and `auto` eval mode. Stop it with `stop()`.
  */
+import { key } from '../../src/core/index.ts'
 import { Context } from '@deepseek-ai/cordis'
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
@@ -164,11 +165,16 @@ export async function startRuntime(seed?: (store: Store) => void) {
   /** Each Session's next step, which takes the messages that wait for one. */
   const steps = new Map<string, () => void>(), claims = new Map<string, () => void>()
   const tools = new Map<string, Map<string, RegisteredTool>>()
+  /** Each Session's system prompt section, which its role's prompt is rendered from. */
+  const sections = new Map<string, (context: { signal?: AbortSignal }) => string>()
+  /** Creation order of the fixture's Sessions, which `sessions.list` reports as `header.createdAt`. */
+  let created = 0
+  const workspaceRegistry = { create: vi.fn(async (cwd: string) => ({ id: cwd })) }
   const deliveries = vi.fn<(request: Delivery) => void>()
   let http!: HttpHandler
   const resolveDefault = async (id: string) => agents.has(id) ? { agent: agents.get(id) } : { error: { code: 'session/not-found' } }
   const controller = {
-    create: vi.fn(async ({ sessionId }: { sessionId: string }) => {
+    create: vi.fn(async ({ sessionId, workspaceId }: { sessionId: string; workspaceId?: string }) => {
       if (agents.has(sessionId)) return
       const agentCtx = new Context()
       const sessionTools = new Map<string, RegisteredTool>()
@@ -176,7 +182,10 @@ export async function startRuntime(seed?: (store: Store) => void) {
       const register = (tool: RegisteredTool) => { sessionTools.set(tool.name, tool); return () => sessionTools.delete(tool.name) }
       agentCtx.reflect.provide('tools', { register, get: () => undefined, restrict: vi.fn(() => () => {}), guard: vi.fn(() => () => {}) })
       agentCtx.reflect.provide('skills', { register: () => () => {} })
-      agentCtx.reflect.provide('systemPrompt', { section: () => () => {} })
+      agentCtx.reflect.provide('systemPrompt', { section: (spec: { text: (context: { signal?: AbortSignal }) => string }) => {
+        sections.set(sessionId, spec.text)
+        return () => {}
+      } })
       const inbox = { nextTurn: [] as UserMessage[], nextStep: [] as UserMessage[],
         // A pending message taken out, as DSH's inbox does by its id.
         remove: (id: string) => [inbox.nextTurn, inbox.nextStep].some(list => {
@@ -210,7 +219,8 @@ export async function startRuntime(seed?: (store: Store) => void) {
         turn++
         take(true)
       })
-      const session = { id: sessionId, snapshotEvents: () => [], requestHeader: () => undefined, append: vi.fn() }
+      const session = { id: sessionId, header: { cwd: workspaceId, createdAt: ++created, parentSession: undefined },
+        snapshotEvents: () => [], requestHeader: () => undefined, append: vi.fn() }
       let status = 'idle'
       const idle: (() => void)[] = []
       // A cancel drops the inbox unless kept, and the turn it stops ends a moment later, which DSH says.
@@ -230,6 +240,7 @@ export async function startRuntime(seed?: (store: Store) => void) {
         whenIdle: () => status === 'idle' ? Promise.resolve() : new Promise<void>(resolve => { idle.push(resolve) }) } as never)
     }),
     selectModel: vi.fn(async () => {}), resolveAgent: vi.fn(resolveDefault), rename: vi.fn(async () => {}),
+    modelCatalog: vi.fn(async () => ({ groups: [] })),
     prompt: vi.fn(() => { throw new Error('Plugin delivery must not use user RPC') }),
     inspect: vi.fn(async () => ({ events: [] })),
   }
@@ -238,9 +249,12 @@ export async function startRuntime(seed?: (store: Store) => void) {
   const webServer = { host: '127.0.0.1', port: 3082, register: (route: { handler: HttpHandler }) => { http = route.handler; return () => {} } }
   const jobs = jobRegistry(id => agents.get(id))
   const subagents = subagentRuntime(agents)
+  /** DSH's session list, which the Runtime scans for the latest Session of each role workspace (C-13c). */
+  const sessionList = { list: vi.fn(() => [...agents.values()].map(agent => ({ id: agent.id,
+    header: (agent as unknown as { session: { header: { cwd?: string; createdAt: number; parentSession?: string } } }).session.header }))) }
   const services = { agents, llm: { resolveCallConfig: vi.fn(async (value: unknown) => value) }, sessionController: controller,
-    sessionPersistence: persistence, workspaceRegistry: { create: async (cwd: string) => ({ id: cwd }) }, permissionPresets: { set: () => {} }, subprocess, webServer,
-    jobs: jobs.service, subagents: subagents.service }
+    sessionPersistence: persistence, workspaceRegistry, permissionPresets: { set: () => {} }, subprocess, webServer,
+    jobs: jobs.service, subagents: subagents.service, sessions: sessionList }
   const ctx = new Context()
   for (const [name, service] of Object.entries(services)) ctx.reflect.provide(name, service)
   for (const cli of [AGENT, BOT]) writeFileSync(cli, '#!/bin/sh\n', { mode: 0o755 })
@@ -248,30 +262,57 @@ export async function startRuntime(seed?: (store: Store) => void) {
   const sources = { github: { enabled: true, config: { repository: 'acme/widgets', cli: AGENT } }, feishu: { enabled: true, config: { cli: BOT } } }
   seeded.saveSettings(SettingsSchema.parse({ ...seeded.settings(), sources }))
   seed?.(seeded)
+  // A test never works in the real default root (`D:/buzhiding`): its tickets go under the fixture's own temp directory. Set
+  // after `seed` too, since a seed that saves a whole settings object would otherwise reset the directory to its default.
+  const afterSeed = seeded.settings()
+  seeded.saveSettings(SettingsSchema.parse({ ...afterSeed, executor: { ...afterSeed.executor, directory: join(directory, 'tickets') } }))
   seeded.close()
-  const runtime = new Runtime(ctx, testMachine({ stateDir: directory }), vi.fn())
+  // The main Session is the person to open: the fixture has one already, as a person who opened it before the plugin started.
+  const machine = testMachine({ stateDir: directory })
+  await (controller.create as unknown as (options: unknown) => Promise<void>)({ sessionId: `orchestrator-${key(directory)}`, workspaceId: machine.masterWorkspace })
+  const runtime = new Runtime(ctx, machine, vi.fn())
   await runtime.ready
   runtime.sources.register(feishuKind); runtime.sources.register(githubKind)
   const settings = runtime.store.settings()
   runtime.store.saveSettings({ ...settings, eval: { ...settings.eval, mode: 'auto' },
-    policy: { ...settings.policy, sources: { feishu: { allowed: [{ id: MEMBER, name: 'Alice' }], syncChat: CHAT }, github: { allowed: [{ id: 'alice' }] } } },
+    policy: { ...settings.policy, sources: { ...settings.policy.sources, feishu: { allowed: [{ id: MEMBER, name: 'Alice' }], syncChat: CHAT }, github: { allowed: [{ id: 'alice' }] } } },
     sources: { ...sources, feishu: { enabled: true, config: { cli: BOT, chats: [{ chatId: CHAT, listen: 'all' }], directMessages: true } } } })
   deliveries.mockClear()
 
   /** Parsed JSON payloads delivered to `sessionId`. */
   const relays = (sessionId: string) => deliveries.mock.calls.map(([call]) => call).filter(call => call.sessionId === sessionId)
-    .map(call => JSON.parse(call.text) as Record<string, unknown>)
+    .map(call => { try { return JSON.parse(call.text) as Record<string, unknown> } catch { return { text: call.text } as Record<string, unknown> } })
+  /** The instruction each trigger and task of an accept got, so a second dispatch of one task stays one ticket. */
+  const instructions = new Map<string, string>()
   const candidates = () => relays(runtime.masterId).filter(item => item.kind === 'candidate').map(item => item.trigger_id)
   const runTool = async (sessionId: string, name: string, args: unknown) => {
     const tool = tools.get(sessionId)?.get(name)
     if (!tool) throw new Error(`Tool ${name} is not registered for ${sessionId}`)
     return await tool.execute(args, { signal: new AbortController().signal }) as Record<string, unknown>
   }
-  /** Route one decision with the main Session's orchestrator_route, answering its result; a refused one throws its reason. */
+  /**
+   * Route one decision as the foreman, answering its result; a refused one throws its reason. A ticket is created only under
+   * an approved instruction (C-22), so an accept the caller did not put under one gets an instruction the fixture approves,
+   * one per trigger and task: the same task names the same ticket, and another task is another ticket (C-09).
+   */
   async function route(item: Record<string, unknown>): Promise<Record<string, unknown>> {
-    const { results } = await runTool(runtime.masterId, 'orchestrator_route', { decisions: [item] }) as { results: Record<string, unknown>[] }
+    const decision = item.kind === 'accept' && typeof item.proposal !== 'string' ? underInstruction(item) : item
+    const { results } = await runTool(runtime.rotation.foremanSession(), 'orchestrator_route', { decisions: [decision] }) as { results: Record<string, unknown>[] }
     if (results[0]!.refused) throw new Error(String(results[0]!.refused))
     return results[0]!
+  }
+  /** The accept with an instruction the fixture drafted and approved for its trigger and task. */
+  function underInstruction(item: Record<string, unknown>): Record<string, unknown> {
+    const task = typeof item.task === 'number' ? item.task : 1
+    const id = `${String(item.trigger_id)}:${task}`
+    let proposal = instructions.get(id)
+    if (!proposal) {
+      const titled = String(item.title ?? 'Fixture work')
+      proposal = runtime.proposals.draft({ tasks: [{ title: titled, request: titled, accept: titled }], heard: titled }).id
+      runtime.proposals.approve(proposal)
+      instructions.set(id, proposal)
+    }
+    return { ...item, proposal, task }
   }
   async function acceptedTicket(trigger: Trigger) {
     runtime.receive(trigger)
@@ -293,7 +334,7 @@ export async function startRuntime(seed?: (store: Store) => void) {
   const step = (sessionId: string) => { steps.get(sessionId)!() }
   /** A step of the worker claims what waits for it, and is cut off before the Session took it. */
   const claim = (sessionId: string) => { claims.get(sessionId)!() }
-  return { runtime, ctx, directory, agents, tools, deliveries, relays, candidates, runTool, route, acceptedTicket, api, controller, subprocess, hooks, resolveDefault, stop,
-    jobs, subagents, step, claim }
+  return { runtime, ctx, directory, agents, tools, sections, workspaceRegistry, deliveries, relays, candidates, runTool, route, acceptedTicket, api, controller,
+    subprocess, hooks, resolveDefault, stop, jobs, subagents, step, claim }
 }
 export type Host = Awaited<ReturnType<typeof startRuntime>>

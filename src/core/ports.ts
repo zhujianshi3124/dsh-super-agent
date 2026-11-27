@@ -1,5 +1,5 @@
 /** Ports the core depends on. Sources, policies, assessors, executors, and channels are project-specific. */
-import type { Assignment, ChannelRef, Decision, DecisionKind, Mandate, MandateBasis, Strength, Thread, Ticket, TicketEndBy, TicketOutcome, Trigger }
+import type { Assignment, ChannelRef, Decision, DecisionKind, Mandate, MandateBasis, Proposal, Strength, Thread, Ticket, TicketEndBy, TicketOutcome, Trigger }
   from './model.ts'
 import type { Reason } from './reasons.ts'
 
@@ -18,7 +18,7 @@ export interface Policy {
   version: string
   paused: boolean
   gate(trigger: Trigger, thread: Thread, tickets: Ticket[]): GateResult
-  /** Re-check a mandate's gate-layer basis under this policy, such as before an ended ticket resumes. */
+  /** Re-check a mandate's gate-layer basis under this policy, such as before new work continues an earlier ticket's task. */
   revalidate(mandate: Mandate): boolean
   /** Whether an inferred candidate may be accepted on the rules its assessment matched: assessments accept, and each rule is enabled. */
   admitsInferred(rules: readonly string[]): boolean
@@ -42,7 +42,15 @@ export type AssessmentOutcome =
   | { kind: 'unavailable'; reason: string | Reason; audit?: Record<string, unknown> }
   /** An accept: `rules` the assessment matched, `name` the ticket's requested short name, and `note` a routing note for its worker. */
   | { kind: 'accept'; title: string; scope: string; reason: string | Reason; acknowledgement?: string; rules?: string[]; audit?: Record<string, unknown>;
-    name?: string; note?: string }
+    name?: string; note?: string
+    /** The worker session the person named to take this ticket, if any. */
+    workerSession?: string
+    /** The directory the person named for this task (N-10); wins over the default worker workspace. */
+    workspace?: string
+    /** The foreman judged this task small enough for a session between 35% and 40% (C-12a): estimated usage at most 5%. */
+    smallTask?: boolean
+    /** The confirmed instruction's completion criteria for this task, so the worker reports evidence against each one. */
+    acceptance?: string[] }
   | { kind: 'stop'; ticketId: string; reason: string | Reason; audit?: Record<string, unknown> }
 
 /** Semantic judgement. `request` queues the assessment, idempotently per `evalId`; the outcome returns through `Engine.decide`. */
@@ -89,7 +97,7 @@ export interface DomainEvents {
   'decision.recorded': { decisionId: string; kind: DecisionKind; threadKey: string }
   'ticket.created': { ticketId: string; decisionId: string; strength: Strength }
   'ticket.resumed': { ticketId: string; triggerId: string }
-  'ticket.ended': { ticketId: string; by: TicketEndBy; outcome: TicketOutcome; reason?: string }
+  'ticket.ended': { ticketId: string; by: TicketEndBy; outcome: TicketOutcome; stop?: import('./model.ts').TicketStopReason; reason?: string }
   'assignment.started': { ticketId: string; assignmentId: string }
   'assignment.ended': { ticketId: string; assignmentId: string; reason: string }
   'thread.subscribed': { threadKey: string; ticketId: string }
@@ -130,5 +138,11 @@ export interface Repositories {
     get(id: string): Decision | undefined
     save(decision: Decision): void
     byThread(key: string): Decision[]
+  }
+  proposals: {
+    get(id: string): Proposal | undefined
+    save(proposal: Proposal): void
+    /** Newest first. */
+    list(): Proposal[]
   }
 }

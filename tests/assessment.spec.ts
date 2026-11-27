@@ -2,7 +2,6 @@
 import { expect, it, vi } from 'vitest'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import { AssessmentSchema, EvalReadSchema, MasterAssessor, type AssessorHost } from '../src/app/assessment.ts'
-import { mainAdmissionPolicy } from '../src/app/context.ts'
 import { Engine, MemoryRepositories, type Executor, type Policy, type Trigger } from '../src/core/index.ts'
 import type { Commands } from '../src/infra/commands.ts'
 import { SettingsSchema } from '../src/policy.ts'
@@ -40,6 +39,7 @@ function setup(strength: 'explicit' | 'inferred' = 'inferred', bodies = Array.fr
     get engine() { return engine }, commands, deployment: testDeployment(), settings: () => SettingsSchema.parse({}),
     threadContext: threadContext ?? (trigger => sources.threadContext(trigger)),
     effects: { enqueue: () => {}, handle: () => {} }, paused: () => false, deliver: async () => {}, candidateCard: async candidate => ({ eval_id: candidate.evalId }),
+    claimed: () => false,
   }
   const assessor = new MasterAssessor(host)
   const policy: Policy = { version: 'v1', paused: false, evalTimeoutMs: 600_000, gate: () => ({ admissible: true, strength, basis: { via: 'followup' } }),
@@ -111,10 +111,10 @@ it('reads the context of a Trigger through its Source, and none for a Source tha
   expect(await s.tools.orchestrator_eval_read!({ trigger_id: 'other-2', resource: 'message', offset: 0 },
     signal)).toMatchObject({ text: 'issue 2' })
 })
-it('routes an explicit candidate instead of assessing it: each eval tool names the routing tools', async () => {
+it('routes an explicit candidate instead of assessing it: each eval tool says to draft an instruction', async () => {
   const s = setup('explicit')
   s.engine.receive(issue(1)); s.engine.evaluateDue()
-  const routed = 'orchestrator_route with its trigger_id and kind accept, attach, stop or ignore'
+  const routed = 'draft a numbered instruction from it with orchestrator_proposal'
   await expect(s.assessor.context('issue-1', signal)).rejects.toThrow(routed)
   await expect(s.tools.orchestrator_eval_read!({ trigger_id: 'issue-1', resource: 'message', offset: 0 }, signal)).rejects.toThrow(routed)
   const direction = { implementation_requested: false, target_basis: 'undetermined', requires_design_decision: false, evidence: 'chatter' }
@@ -123,7 +123,6 @@ it('routes an explicit candidate instead of assessing it: each eval tool names t
 })
 
 it('asks the assessment only for decisions its tool accepts, which no longer include reopen or stop', () => {
-  expect(mainAdmissionPolicy).not.toMatch(/reopen|decision=stop/)
   const direction = { implementation_requested: true, target_basis: 'specified', requires_design_decision: false, evidence: 'e' }
   const result = (decision: string, extra = {}) =>
     AssessmentSchema.safeParse({ decision, rule_assessments: [], direction, title: 't', scope: 's', reason: 'r', ...extra }).success

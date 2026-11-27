@@ -2,10 +2,10 @@
 import { DatabaseSync, type SQLInputValue } from 'node:sqlite'
 import { chmodSync, mkdirSync } from 'node:fs'
 import { dirname } from 'node:path'
-import { key, threadKey, type ChannelRef, type Decision, type OutboundMessage, type ReplyStatus, type Repositories, type Thread, type ThreadFact,
+import { key, threadKey, type ChannelRef, type Decision, type OutboundMessage, type Proposal, type ReplyStatus, type Repositories, type Thread, type ThreadFact,
   type ThreadFacts, type Ticket, type Trigger, type TriggerDisposition } from '../core/index.ts'
 import { KV, type Family, type Key } from '../kv.ts'
-import { SettingsSchema, type Settings, type SettingsOrigin, type SettingsSave } from '../policy.ts'
+import { normalizeSettings, SettingsSchema, type Settings, type SettingsOrigin, type SettingsSave } from '../policy.ts'
 import { OLDEST_SCHEMA, SCHEMA_VERSION, migrateTo11, tooOld } from './migration.ts'
 import { Versions } from './versions.ts'
 import { storeReads } from './store-read.ts'
@@ -74,6 +74,7 @@ export class Store implements Repositories {
             CREATE TABLE IF NOT EXISTS thread (key TEXT PRIMARY KEY, value TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS ticket (id TEXT PRIMARY KEY, value TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS decision (id TEXT PRIMARY KEY, thread TEXT NOT NULL, value TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS proposal (id TEXT PRIMARY KEY, value TEXT NOT NULL, at TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS outbox (id TEXT PRIMARY KEY, value TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS trigger_thread (thread TEXT NOT NULL, id TEXT NOT NULL, at TEXT NOT NULL, human INTEGER NOT NULL,
               PRIMARY KEY (thread, id));
@@ -183,12 +184,12 @@ export class Store implements Repositories {
   /** Versioned settings snapshots; the current settings are the snapshot of the latest revision. */
   private readonly settingsVersions = new Versions<SettingsVersion>(this, KV.settings.revision, KV.settings.version)
   /** Current validated settings. */
-  settings(): Settings { return SettingsSchema.parse(this.settingsVersions.current()?.settings ?? {}) }
+  settings(): Settings { return SettingsSchema.parse(normalizeSettings(this.settingsVersions.current()?.settings ?? {})) }
   /** Revision of one settings block; each configuration page saves against its own block for optimistic concurrency. */
   blockRevision(block: SettingsSave): number { return this.get(KV.settings.block(block)) ?? 0 }
   /** Saves settings as the next revision (making it current) and increments `record.block`'s revision counter when present. */
   saveSettings(value: unknown, record: Omit<SettingsVersion, 'revision' | 'savedAt' | 'settings'> = { source: 'internal', policyVersion: '', policyChanged: false, notified: [] }): Settings {
-    const settings = SettingsSchema.parse(value)
+    const settings = SettingsSchema.parse(normalizeSettings(value))
     return this.atomic(() => {
       this.settingsVersions.save(revision => ({ ...record, revision, savedAt: new Date().toISOString(), settings }))
       if (record.block) this.set(KV.settings.block(record.block), this.blockRevision(record.block) + 1)
@@ -244,6 +245,13 @@ export class Store implements Repositories {
     get: (id: string): Decision | undefined => { const row = this.db.prepare('SELECT value FROM decision WHERE id=?').get(id); return row ? JSON.parse(String(row.value)) as Decision : undefined },
     save: (decision: Decision): void => { this.db.prepare('INSERT INTO decision VALUES (?,?,?) ON CONFLICT(id) DO UPDATE SET value=excluded.value, thread=excluded.thread').run(decision.id, decision.threadKey, JSON.stringify(decision)) },
     byThread: (threadKeyValue: string): Decision[] => this.db.prepare('SELECT value FROM decision WHERE thread=? ORDER BY rowid').all(threadKeyValue).map(row => JSON.parse(String(row.value)) as Decision),
+  }
+  /** Numbered instructions a person confirms before tickets may be created under them; see `Proposals` for the lifecycle. */
+  readonly proposals = {
+    get: (id: string): Proposal | undefined => { const row = this.db.prepare('SELECT value FROM proposal WHERE id=?').get(id); return row ? JSON.parse(String(row.value)) as Proposal : undefined },
+    save: (proposal: Proposal): void => { this.db.prepare('INSERT INTO proposal VALUES (?,?,?) ON CONFLICT(id) DO UPDATE SET value=excluded.value, at=excluded.at').run(proposal.id, JSON.stringify(proposal), proposal.createdAt) },
+    /** Newest first. */
+    list: (): Proposal[] => this.values('SELECT value FROM proposal ORDER BY rowid DESC'),
   }
   /** Read-only queries for management views, orchestrator tools, and source polling (see `storeReads`). */
   readonly read: ReturnType<typeof storeReads>

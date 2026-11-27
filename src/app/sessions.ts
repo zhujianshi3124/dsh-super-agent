@@ -4,17 +4,16 @@ import type { Agent } from '@deepseek-ai/dsh-agent'
 import type { MessageId } from '@deepseek-ai/dsh-llm'
 import { scopeParentOf } from '@deepseek-ai/dsh-scope'
 import type { SessionId } from '@deepseek-ai/dsh-session'
-import { dirname } from 'node:path'
 import { z } from 'zod'
 import { key, liveTicket, type Ticket } from '../core/index.ts'
+import type { Machine } from '../deployment.ts'
 import { mandateInstructions, ticketOfSession } from '../executor/dsh.ts'
 import type { HealthEntry } from '../infra/health.ts'
 import { AgentDelivery, messageId } from './delivery.ts'
 import type { Effects } from './effects.ts'
-import type { Variable } from './execution-environment.ts'
+import { executionRoot, type Variable } from './execution-environment.ts'
 import { RetryHealth } from './retry-health.ts'
 import { initializeRoleModel } from './role-models.ts'
-import { bundledSkills } from './skill-files.ts'
 import { SKILL_PREFIX, type PromptVersion, type Prompts } from './prompts.ts'
 import type { Store } from './store.ts'
 import { KV } from '../kv.ts'
@@ -25,17 +24,29 @@ export interface SessionsHost {
   /** DSH Cordis context: sessions, agents, persistence, and their events. */
   readonly context: Context
   readonly store: Pick<Store, 'tickets' | 'settings' | 'get' | 'set' | 'keys'>
-  readonly prompts: Pick<Prompts, 'current' | 'version' | 'compose' | 'skills'>
+  readonly prompts: Pick<Prompts, 'current' | 'version' | 'compose' | 'composeForeman' | 'skills'>
   readonly effects: Pick<Effects, 'enqueue' | 'handle' | 'idle' | 'pending'>
   /** The `models` health entry, which reports managed sessions waiting on a model-budget retry. */
   readonly health: HealthEntry
   readonly masterId: string
+  /** The machine's state directory, which locates the execution root a worker Session lands in. */
+  readonly machine: Pick<Machine, 'stateDir'>
+  /** Whether a session is the current or an earlier main session; defaults to comparing with `masterId`. */
+  isMasterSession?(id: string): boolean
+  /** The session that currently holds a ticket's worker slot, which only it may be (C-05). */
+  currentWorker?(ticketId: string): string
+  /** Whether a session is the current or an earlier foreman session. */
+  isForemanSession?(id: string): boolean
+  /** The foreman session a successor inherits model, reasoning effort and permissions from. */
+  foremanSession?(): string
   readonly lifetime: AbortSignal
   closing(): boolean
   /** Execution environment variables for `ticket`, rendered into its worker's system prompt. */
   environment(ticket: Ticket): Variable[]
   /** Tools to register on the main Session (`ticket === undefined`) or on `ticket`'s worker Session. */
   tools(agent: Agent, ticket?: Ticket): Tool[]
+  /** Called for every new Session before it is decorated: the host may adopt it as the main Session the person opened. */
+  adoptMain?(agent: Agent): Promise<void> | void
 }
 
 /**
@@ -60,6 +71,13 @@ declare module '@deepseek-ai/cordis' {
  */
 const WORK_TOOLS = ['read', 'write', 'edit', 'read_image', 'glob', 'grep', 'bash', 'pwsh', 'job_output', 'job_list', 'job_kill', 'web_search',
   'web_fetch', 'skill', 'todo_write', 'subagent', 'list_subagent_models', 'send_message', 'list_agents', 'interrupt_agent']
+/**
+ * The main Session's own tools. It works in the person's directory, so it keeps a shell and a small view of its jobs.
+ * The foreman keeps the same tools (N-02): the boundary is the prompt, not tool-level confiscation — it plans and dispatches,
+ * and writes only its role records (handoff documents, the ledger), never task files.
+ */
+const MAIN_TOOLS = ['skill', 'bash', 'read', 'read_image', 'job_output', 'job_list', 'job_kill']
+const FOREMAN_TOOLS = ['skill', 'bash', 'read', 'read_image', 'job_output', 'job_list', 'job_kill']
 /** What the main Session is told when it would wait: what it waits for comes to it, and a waiting step holds back the next. */
 const NO_WAIT = 'Reports, follow_up notices, new candidates and a background job\'s end with its output arrive by themselves as messages; '
   + 'end the turn instead of waiting for them.'
@@ -102,29 +120,43 @@ export class Sessions {
     this.agentDelivery = new AgentDelivery(host.context)
     // Deliver relays and notices to the main Session in the order they were queued.
     host.effects.handle('relay', ({ text }, requestId) => this.prompt(host.masterId, requestId, text, 'steer'), { ordered: true })
+    // A worker's report reaches the foreman that dispatched its ticket: it collects the questions of every stopped worker
+    // and asks the person once (C-16a). The main Session still hears the same report, which it passes on in one sentence.
+    host.effects.handle('foreman-relay', ({ text }, requestId) => this.forwardToForeman(requestId, text), { ordered: true })
     host.effects.handle('notice', ({ value, summary }, name) => this.inject(name, value, summary), { ordered: true })
   }
   /** Subscribes to host agent and session events so newly created sessions are decorated and model-budget retries are reflected in health. Call once at startup. */
   install(): void {
     const ctx = this.ctx
+    // `global` for the same scope-carrier reason as `agent/created` below: every Session in DSH is another plugin's subject.
     ctx.on('agent/disposed', ({ agent }) => {
       this.release(agent)
       this.retryHealth.clear(agent.id); this.updateModelHealth()
-    })
+    }, { global: true })
     ctx.on('session/event', (session, event) => {
+      const hooks = ctx.superagentHooks
+      if (hooks) hooks.broadcastSessionEvent({ sessionId: session.id,
+        role: this.isMaster(session.id) ? 'orchestrator' : this.host.isForemanSession?.(session.id) ? 'foreman'
+          : ticketOfSession(session.id) ? 'worker' : 'unknown',
+        contextWindow: (session as { requestContext?: () => { contextWindow?: number } }).requestContext?.()?.contextWindow, event })
       const agent = ctx.agents.get(session.id)
       const binding = agent && agent.session === session ? this.bindings.get(agent) : undefined
       if (!agent || !binding || binding.subagent) return
       this.retryHealth.observe(agent.id, event)
       this.updateModelHealth()
-    })
-    ctx.on('agent/created', async ({ agent }) => { await this.decorate(agent); return undefined })
+    }, { global: true })
+    // The main Session belongs to the person: a Session they open in the main workspace is adopted here, then decorated as such.
+    // `global`: DSH dispatches agent events through a scope carrier (`scopeTarget(agent, agent)` in `@deepseek-ai/dsh-agent`),
+    // and a listener owned by a plugin's own scope is filtered out of notices about sessions another plugin created — the real
+    // desktop opens its Sessions in the API session controller's scope, so without `global` this never fired outside tests.
+    ctx.on('agent/created', async ({ agent }) => { await this.host.adoptMain?.(agent); await this.decorate(agent); return undefined },
+      { global: true })
     // Opening a Session in DSH's Web UI before its first turn may select the default preset for it: select ours again. After
     // its first turn DSH refuses any selection, which leaves it as it is.
     ctx.inject(['agentPresets'], child => {
       child.on('agent-preset/selected', (sessionId, preset) => {
         const ticketId = ticketOfSession(sessionId), agent = ctx.agents.get(sessionId as SessionId)
-        const ours = sessionId === this.host.masterId ? ROUTER_PRESET : ticketId && this.host.store.tickets.get(ticketId) ? WORKER_PRESET : undefined
+        const ours = this.isMaster(sessionId) ? ROUTER_PRESET : ticketId && this.host.store.tickets.get(ticketId) ? WORKER_PRESET : undefined
         if (!ours || preset === ours || !agent) return
         const presets = child.get('agentPresets') as { select(agent: Agent, preset: string): Promise<string> }
         presets.select(agent, ours).catch(() => {})
@@ -132,27 +164,99 @@ export class Sessions {
     })
     ctx.on('agent/status', ({ agent, status }) => {
       if (status === 'idle' && !this.host.closing()) { this.retryHealth.clear(agent.id); this.updateModelHealth() }
-    })
+    }, { global: true })
   }
-  /** Resolves or creates session `id` in workspace `cwd`, initializes its role model, decorates it with prompts/skills/tools, sets `danger-full-access` permissions, and renames it to `title`. */
-  async ensure(id: string, cwd: string, title: string, role: 'orchestrator' | 'worker'): Promise<Agent> {
+  /**
+   * Resolves or creates session `id`, initializes its role model, decorates it with prompts/skills/tools, sets
+   * `danger-full-access` permissions, and renames it to `title`. A Session is created in the workspace of its role: `cwd`
+   * for the main and foreman Sessions, and the execution root for a worker, whose own ticket directory reaches it as
+   * `DSH_SUPERAGENT_DIR` instead (see `workspaceOf`).
+   */
+  async ensure(id: string, cwd: string, title: string, role: 'orchestrator' | 'worker' | 'foreman', inheritFrom?: string,
+    workspace?: string): Promise<Agent> {
     const ctx = this.ctx
     let result = await ctx.sessionController.resolveAgent(id as SessionId)
     if ('error' in result && result.error.code === 'session/not-found') {
-      const workspace = await ctx.workspaceRegistry.create(cwd)
+      const created = await ctx.workspaceRegistry.create(this.workspaceOf(role, cwd, workspace))
       // A Session keeps the preset it was created with, one of the bundle's own (cordis.patch.yml).
-      await ctx.sessionController.create({ sessionId: id as SessionId, workspaceId: workspace.id,
+      await ctx.sessionController.create({ sessionId: id as SessionId, workspaceId: created.id,
         agentPreset: role === 'worker' ? WORKER_PRESET : ROUTER_PRESET })
       result = await ctx.sessionController.resolveAgent(id as SessionId)
     }
     if ('error' in result) throw result.error
     const settings = this.host.store.settings()
-    await initializeRoleModel(ctx, result.agent, role === 'orchestrator' ? settings.eval.model : settings.executor.model)
+    const globalModel = role === 'orchestrator' ? settings.eval.model : settings.executor.model
+    // A successor inherits the session it replaces FIRST (C-09c); a first foreman copies the main Session, and a first worker
+    // copies the foreman (C-09b). The global role model only seeds what inheritance left unset — seeding first would make the
+    // inheritance guard skip the copy whenever a worker model is configured.
+    if (role !== 'orchestrator') {
+      const source = inheritFrom ?? (role === 'worker' ? this.host.foremanSession?.() ?? this.host.masterId : this.host.masterId)
+      await this.inherit(id, source)
+    }
+    await initializeRoleModel(ctx, result.agent, globalModel)
     await this.decorate(result.agent)
-    ctx.permissionPresets.set(result.agent.session, 'danger-full-access')
     await ctx.sessionController.rename({ sessionId: id as SessionId, title })
     return result.agent
   }
+  /**
+   * Applies the model, reasoning effort and permission preset of session `fromId` to `id`, for a successor that keeps what
+   * the session it replaces ran with (C-09c) and for a new main Session that keeps the earlier one's (C-13c). A session that
+   * cannot be read is left as it is. `force` writes the inherited model even over a selection the new session already carries,
+   * which C-13c's one-time write on adoption requires.
+   */
+  async inherit(id: string, fromId: string, force = false): Promise<void> {
+    const result = await this.ctx.sessionController.resolveAgent(id as SessionId)
+    if ('error' in result) return
+    await this.applyInheritance(result.agent, fromId, force)
+    try { await this.ensurePermission(result.agent, fromId) }
+    catch { this.ctx.permissionPresets.set(result.agent.session, 'danger-full-access') }
+  }
+  /** Copies `fromId`'s model and reasoning effort onto `agent` when it is readable; leaves the global model otherwise. */
+  private async applyInheritance(agent: Agent, fromId: string, force = false): Promise<void> {
+    try {
+      const from = await this.ctx.sessionController.resolveAgent(String(fromId) as SessionId)
+      if ('error' in from || !from.agent) return
+      const route = from.agent.session.requestHeader()?.config as { provider?: string; model?: string; reasoningEffort?: unknown } | undefined
+      if (route?.provider && route?.model) await initializeRoleModel(this.ctx, agent, { provider: route.provider, model: route.model,
+        ...(route.reasoningEffort ? { reasoningEffort: route.reasoningEffort as string } : {}) }, force)
+    } catch (error) { this.ctx.logger.warn('dsh-superagent: could not inherit settings: %s', String(error)) }
+  }
+  /** Sets `agent`'s permission preset to `fromId`'s when that preset is one this build knows. */
+  private async ensurePermission(agent: Agent, fromId: string): Promise<void> {
+    const from = await this.ctx.sessionController.resolveAgent(String(fromId) as SessionId)
+    if ('error' in from || !from.agent) { this.ctx.permissionPresets.set(agent.session, 'danger-full-access'); return }
+    const presets = this.ctx.permissionPresets as unknown as { current(s: unknown): string; names?: string[] }
+    const current = presets.current(from.agent.session)
+    if (current && current !== 'custom' && (!presets.names || presets.names.includes(current))) this.ctx.permissionPresets.set(agent.session, current)
+    else this.ctx.permissionPresets.set(agent.session, 'danger-full-access')
+  }
+  /**
+   * The workspace a Session of `role` is created in. A worker lands in the directory the person named, when they named one;
+   * otherwise all workers share the default worker workspace (`D:\buzhiding`), whose subdirectory is the ticket's own
+   * directory (`DSH_SUPERAGENT_DIR`), because one workspace per ticket would fill the person's sidebar (N-10).
+   * The main and foreman Sessions keep the directory they are given.
+   */
+  private workspaceOf(role: 'orchestrator' | 'worker' | 'foreman', cwd: string, workspace?: string): string {
+    return role === 'worker' ? workspace || executionRoot(this.host.store.settings(), this.host.machine.stateDir) : cwd
+  }
+  /** Whether session `id` exists on this host, without creating it: the main Session is the person's to open. */
+  async exists(id: string): Promise<boolean> {
+    const result = await this.ctx.sessionController.resolveAgent(id as SessionId)
+    return !('error' in result)
+  }
+  /** Renames a session, which rotation uses to mark the generation it replaced without deleting it. */
+  async rename(id: string, title: string): Promise<void> {
+    await this.ctx.sessionController.rename({ sessionId: id as SessionId, title })
+  }
+  /**
+   * Rebinds an agent whose role changed: a demoted main Session, foreman or worker keeps its history only, so its old prompt
+   * section, tools and skills are released and it is decorated anew as what it now is (N-01a, N-02a, C-05).
+   */
+  async redecorate(agent: Agent): Promise<void> {
+    this.release(agent)
+    await this.decorate(agent)
+  }
+
   /** Returns whether `sessionId` already holds the message delivered under `requestId`, or `false` if the session does not exist. */
   async holds(sessionId: string, requestId: string): Promise<boolean> {
     const result = await this.ctx.sessionController.resolveAgent(sessionId as SessionId)
@@ -169,6 +273,17 @@ export class Sessions {
   promptedId(requestId: string): MessageId { return messageId(key(requestId)) }
   /** Enqueues a steering relay to the main Session; relays are durable and retried by `Effects` until delivered, at most once per `requestId`. */
   relay(requestId: string, text: string): void { this.host.effects.enqueue('relay', requestId, { text }) }
+  /**
+   * Enqueues a durable relay of a worker's report to the foreman, the role that collects every stopped worker's question and
+   * reports it once (C-16a); the next turn of whichever generation fills the slot reads it.
+   */
+  foremanRelay(requestId: string, text: string): void { this.host.effects.enqueue('foreman-relay', requestId, { text }) }
+  /** Delivers a queued relay to the foreman slot; a host without one drops it, as no role is there to collect anything. */
+  private async forwardToForeman(requestId: string, text: string): Promise<void> {
+    const foreman = this.host.foremanSession?.()
+    if (!foreman) return
+    await this.prompt(foreman, requestId, text, 'queue')
+  }
   /** Enqueues a durable background notice for injection into the main Session; a new notice with the same `name` replaces a still-waiting notice of that `name`. */
   notify(name: string, value: Record<string, unknown>, summary: string): void { this.host.effects.enqueue('notice', name, { value, summary }) }
   /** Waits for currently runnable `notice` effects to settle and returns `'injected'` if notice `name` has reached the main Session or `'pending'` if it is still queued. */
@@ -227,14 +342,23 @@ export class Sessions {
   }
   private ticketOf(agent: Agent): Ticket | undefined {
     const ticketId = ticketOfSession(agent.id)
-    return ticketId === undefined ? undefined : this.host.store.tickets.get(ticketId)
+    if (ticketId === undefined) return undefined
+    // A generation the ticket rotated away from no longer holds it: only the current worker session is its worker (C-05).
+    const current = this.host.currentWorker?.(ticketId)
+    if (current !== undefined && current !== agent.id) return undefined
+    return this.host.store.tickets.get(ticketId)
+  }
+  /** Whether `id` is the current or an earlier main session (rotation keeps the slot, not the id). */
+  private isMaster(id: string): boolean {
+    return this.host.isMasterSession ? this.host.isMasterSession(id) : id === this.host.masterId
   }
   private async decorate(agent: Agent): Promise<void> {
     if (this.bindings.has(agent)) return
     const host = this.host
-    const master = agent.id === host.masterId
-    const ticket = master ? undefined : this.ticketOf(agent)
-    if (!master && !ticket) { this.limitSubagent(agent); return }
+    const master = this.isMaster(agent.id)
+    const foreman = !master && !!host.isForemanSession?.(agent.id)
+    const ticket = master || foreman ? undefined : this.ticketOf(agent)
+    if (!master && !foreman && !ticket) { this.limitSubagent(agent); return }
     const binding: SessionBinding = { disposers: [] }
     this.bindings.set(agent, binding)
     this.retryHealth.restore(agent.id, agent.session.snapshotEvents())
@@ -244,7 +368,8 @@ export class Sessions {
     binding.disposers.push(agent.ctx.systemPrompt.section({ name: 'dsh-superagent-policy', order: 9999, interpolate: false, text: context => {
       const version = this.promptFor(agent, context.signal !== undefined)
       const current = ticket && host.store.tickets.get(ticket.id)
-      const composed = host.prompts.compose(version.config, master ? 'orchestrator' : 'worker', current ? host.environment(current) : undefined)
+      const composed = foreman ? host.prompts.composeForeman(version.config, current ? host.environment(current) : undefined)
+        : host.prompts.compose(version.config, master ? 'orchestrator' : 'worker', current ? host.environment(current) : undefined)
       return `[dsh-superagent prompt revision ${version.revision}]\n${composed}\n${current ? mandateInstructions(current.mandate) : ''}`
     }, ...(master ? { complete: true } : {}) }))
     // A recreated skill scope (e.g. after the skills service restarts) starts empty, so reset `binding.skills` before rebinding.
@@ -259,8 +384,8 @@ export class Sessions {
     if (this.bindings.get(agent) !== binding) return
     const register = this.registerTool(agent, binding)
     for (const tool of host.tools(agent, ticket)) register(tool.name, tool.description, tool.schema, tool.execute)
-    if (master) {
-      binding.disposers.push(agent.ctx.tools.restrict({ allow: ['skill', 'bash', 'read', 'read_image', 'job_output', 'job_list', 'job_kill'] }),
+    if (master || foreman) {
+      binding.disposers.push(agent.ctx.tools.restrict({ allow: [...master ? MAIN_TOOLS : FOREMAN_TOOLS] }),
         agent.ctx.tools.guard(execution => noWait(execution, () => this.routed(agent))))
     } else {
       // An Executor Session keeps the profile's work tools it has, which DSH requires to be known; its own tools are not masked.
@@ -290,9 +415,17 @@ export class Sessions {
     const store = this.host.store
     const parent = scopeParentOf(agent)
     const allow = WORK_TOOLS.filter(name => agent.ctx.tools.get(name, parent))
+    // A subagent is not a generation of the ticket's worker: only the worker's own Session leaves with a rotation (C-05).
+    const holds = ticketOfSession(agent.id) === ticketId
     return [agent.ctx.tools.restrict({ allow }), agent.ctx.tools.guard(() => {
       const current = store.tickets.get(ticketId)
-      return !current || !liveTicket(current) ? 'Ticket ended; new work needs a new authorized ticket' : undefined
+      if (!current || !liveTicket(current)) return 'Ticket ended; new work needs a new authorized ticket'
+      // A generation the ticket rotated away from takes no more work, not even its own ticket's (C-05).
+      if (holds) {
+        const holder = this.host.currentWorker?.(ticketId)
+        if (holder !== undefined && holder !== agent.id) return 'This ticket moved on to a newer worker session, which continues the work; this generation keeps its history only'
+      }
+      return undefined
     })]
   }
   /**
@@ -317,11 +450,9 @@ export class Sessions {
     previous?.dispose()
     const disposers: (() => void)[] = []
     for (const [name, content] of this.host.prompts.skills(version.config)) {
-      const bundled = name === 'feishu' || name === 'github' ? bundledSkills[name] : undefined
       const body = version.config.skills[name] ?? ''
-      const description = bundled?.description ?? (body.replace(/\s+/g, ' ').slice(0, 120) || 'Custom dsh-superagent operational skill.')
-      disposers.push(scope.skills.register({ name: `${SKILL_PREFIX}${name}`, description, content, source: 'runtime',
-        ...(bundled ? { resourceBase: { kind: 'directory' as const, path: dirname(bundled.path) } } : {}) }))
+      const description = body.replace(/\s+/g, ' ').slice(0, 120) || 'Custom dsh-superagent operational skill.'
+      disposers.push(scope.skills.register({ name: `${SKILL_PREFIX}${name}`, description, content, source: 'runtime' }))
     }
     binding.skills = { revision: version.revision, dispose: () => { disposers.forEach(dispose => dispose()) } }
   }

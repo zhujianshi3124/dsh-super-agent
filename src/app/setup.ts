@@ -76,8 +76,14 @@ export class Setup {
   private async resolve(settings: Settings): Promise<Deployment> {
     const { context, machine, lifetime } = this.host
     const probe = this.probe()
-    const deployment = await resolveDeployment(machine, settings.sources.github?.config, probe)
-    const feishu = await resolveFeishuBot(machine, settings.sources.feishu?.config, probe).catch((error: unknown) => {
+    // Desktop move: Windows has no gh CLI, so GitHub delivery is disabled.
+    // Run a local-only deployment instead of blocking dispatch/sessions.
+    const github = settings.sources.github
+    const localOnly = github?.enabled === false || !github?.config?.cli
+    const deployment = localOnly
+      ? { ...machine, repository: github?.config?.repository ?? '', github: { cli: '', login: '', noreply: '' } } as Deployment
+      : await resolveDeployment(machine, github?.config, probe)
+    const feishu = localOnly ? undefined : await resolveFeishuBot(machine, settings.sources.feishu?.config, probe).catch((error: unknown) => {
       if (!(error instanceof SetupError)) throw error
       this.feishuProblem = error.problem
       context.logger.warn('dsh-superagent leaves Feishu out: %s', error.message)
@@ -88,9 +94,9 @@ export class Setup {
       if (error instanceof SetupError) throw error
       throw new SetupError('environmentFailed', { output: error instanceof Error ? error.message : String(error) })
     }
-    await writeEnvironment(resolved, settings.executor.blockedCommands).catch(machineProblem)
+    if (!localOnly) await writeEnvironment(resolved, settings.executor.blockedCommands).catch(machineProblem)
     this.restoreEnvironment = applyEnvironment(this.variables, machine.stateDir, this.path)
-    await verifyEnvironment(resolved, context.subprocess, lifetime).catch((error: unknown) => {
+    if (!localOnly) await verifyEnvironment(resolved, context.subprocess, lifetime).catch((error: unknown) => {
       this.restore()
       machineProblem(error)
     })

@@ -8,12 +8,11 @@ import { SourceRegistry } from '../src/sources/registry.ts'
 import { feishuKind } from '../src/sources/feishu.ts'
 import { githubKind } from '../src/sources/github.ts'
 import { snapshot, threadSummary, ticketSummary, triggerView } from '../src/app/views/records.ts'
-import { basisFacts, ticketDetail } from '../src/app/views/tickets.ts'
-import { threadDetail } from '../src/app/views/threads.ts'
+import { ticketDetail } from '../src/app/views/tickets.ts'
 import { droppedReplies, sourcesStatus } from '../src/app/views/sources.ts'
 import { overview } from '../src/app/views/overview.ts'
 import { markdown, plain } from '../src/app/views/text.ts'
-import { policyHistory } from '../src/app/settings-history.ts'
+import { executionHistory } from '../src/app/settings-history.ts'
 import { KV } from '../src/kv.ts'
 import { feishuLink } from '../src/sources/feishu-channel.ts'
 import { feishuChannel, feishuTriggerId } from '../src/sources/feishu-trigger.ts'
@@ -112,7 +111,7 @@ it('states each Source by the first state that holds', () => {
     .toEqual({ feishu: 'setup', github: 'setup' })
 })
 
-it('follows the Ticket\'s stage: a blocked Ticket a person answered since is working, with no retry, note or turn end', () => {
+it('follows the Ticket\'s stage: working while its assignment runs, adjudication while a question waits, ended with its stop reason', () => {
   const host = views()
   const blocked = { state: 'blocked' as const, summary: 'Needs the design file', at: '2026-09-22T00:01:00Z' }
   const ticket = { id: 't1', title: 'Fix', decisionId: 'd', channels: [], undelivered: [], createdAt: at, updatedAt: at,
@@ -123,14 +122,22 @@ it('follows the Ticket\'s stage: a blocked Ticket a person answered since is wor
     inputs: [] as { id: string; kind: 'trigger'; triggerId: string; at: string; human?: true }[] }
   store.tickets.save(ticket)
   const row = ticketSummary(store.tickets.get('t1')!)
-  expect(row).toMatchObject({ stage: 'person', action: 'blocked', actions: { retry: true }, note: { text: 'Needs the design file',
-    error: false } })
+  // The stage follows the assignment, not the report; the panel's only ticket action is stop, never a retry (C-38, N-07).
+  expect(row).toMatchObject({ state: 'open', stage: 'working', actions: { stop: true } })
+  expect(row).not.toHaveProperty('note')
+  expect(row.actions).not.toHaveProperty('retry')
+  // A question stops the worker at a clean node: adjudication, with the question as the note (C-16a).
+  store.tickets.save({ ...ticket, attention: { id: 'q', question: 'Needs the design file' } })
+  const asked = ticketSummary(store.tickets.get('t1')!)
+  expect(asked).toMatchObject({ stage: 'adjudication', note: { text: 'Needs the design file', error: false },
+    attention: { question: 'Needs the design file' } })
   expect(ticketDetail(host, 't1')!.assignments[0]).toMatchObject({ turnEndedAt: blocked.at })
-  store.tickets.save({ ...ticket, inputs: [{ id: 'i1', kind: 'trigger', triggerId: 'e2', at: '2026-09-22T00:02:00Z', human: true }] })
-  const answered = ticketSummary(store.tickets.get('t1')!)
-  expect(answered).toMatchObject({ stage: 'working', actions: { retry: false } })
-  expect(answered).not.toHaveProperty('note')
-  expect(ticketDetail(host, 't1')!.assignments[0]).not.toHaveProperty('turnEndedAt')
+  // A delivery failure shows as an error note while the assignment still runs.
+  store.tickets.save({ ...ticket, delivery: { error: 'Session gone', at } })
+  expect(ticketSummary(store.tickets.get('t1')!)).toMatchObject({ stage: 'working', note: { text: 'Session gone', error: true } })
+  // An ended ticket shows why it stopped, and offers no action (N-13).
+  store.tickets.save({ ...ticket, ended: { at, by: 'human', outcome: 'stopped', stop: 'user-stopped', reason: 'asked' } })
+  expect(ticketSummary(store.tickets.get('t1')!)).toMatchObject({ state: 'ended', stage: 'ended', stop: 'user-stopped', actions: { stop: false } })
 })
 
 it('does not show a follow-up that reached a ticket as waiting for an Eval, though an older version queued it', () => {
@@ -152,36 +159,45 @@ it('does not show a follow-up that reached a ticket as waiting for an Eval, thou
 })
 
 const load = { running: 0, queued: 0 }
-const problems = (host: ReturnType<typeof views>, health: Parameters<typeof overview>[1] = {}) =>
-  overview(host, health, 'v1', load).problems
+const foremanState = { session: 'superagent-foreman', generation: 0, pending: false, usage: null, rotatedAt: null, open: true }
 
-it('lists an Eval past its deadline, and as dsh-superagent\'s own errors only parts no Source or Policy sync reports', () => {
+it('lists the tickets that wait for the person\'s adjudication, and the role blocks with their usage', () => {
   const host = views()
-  const evaluating = { id: 'e1', threadKey: 'github:1', triggerIds: ['t1'], strength: 'explicit' as const, actor: { source: 'github',
-    id: 'alice' },
-    basis: { via: 'addressed' as const, addressed: 'mention' as const }, policyVersion: 'v1', startedAt: '2026-01-01T00:00:00Z',
-    deadline: '2026-01-01T00:02:00Z' }
-  store.threads.save({ key: 'github:1', ref: { source: 'github', id: '1' }, createdAt: at, subscriptions: [], correlated: [], pending: [],
-    evaluating, meta: {} })
-  const error = (detail: string) => ({ state: 'error' as const, detail })
-  const health = { relay: error('relay failing'), reply: error('reply failing'), feishu: error('socket closed'),
-    history: error('read failed'),
-    'sync:feishu': error('sync failed'), evals: error('unavailable'), launch: { state: 'ready' as const, detail: '' } }
-  const found = problems(host, health)
-  expect(found).toContainEqual({ kind: 'eval-overdue', thread: expect.objectContaining({ key: 'github:1', stage: 'evaluating' }) })
-  // Effects are dsh-superagent's own; a Source shows its parts and its Policy sync, and the Evals are listed one by one.
-  expect(found.filter(item => item.kind === 'runtime-error')).toEqual([{ kind: 'runtime-error', name: 'relay', detail: 'relay failing' },
-    { kind: 'runtime-error', name: 'reply', detail: 'reply failing' }])
-  expect(found.filter(item => item.kind === 'source-error').map(item => item.source.health.name)).toEqual(['feishu', 'history'])
+  const page = overview(host, load, { masterId: 'master-1', foreman: foremanState })
+  expect(page.problems).toEqual([])
+  expect(page.master).toEqual({ id: 'master-1', generation: 0, usage: null })
+  expect(page.foreman).toEqual(foremanState)
+  expect(page.person).toEqual([])
+  expect(page.executor).toEqual({ ...load, maxWorkers: store.settings().executor.maxWorkers })
+  // A ticket stopped at a clean node with a question waits for the person (C-16a); a working one does not.
+  live('t1')
+  store.tickets.save({ ...store.tickets.get('t1')!, attention: { id: 'q', question: 'Which way?' },
+    assignments: [{ id: 'a1', state: 'running', createdAt: at }] })
+  live('t2')
+  store.tickets.save({ ...store.tickets.get('t2')!, assignments: [{ id: 'a1', state: 'running', createdAt: at }] })
+  expect(overview(host, load, { masterId: 'master-1', foreman: foremanState }).person.map(row => row.id)).toEqual(['t1'])
+  // A usage reading the plugin kept for the main slot shows on the master block (C-37.5).
+  store.set(KV.rotation.master, { current: 'master-1', generation: 1, previous: ['master-0'], usage: { ratio: 0.3, at } })
+  expect(overview(host, load, { masterId: 'master-1', foreman: foremanState }).master).toEqual({ id: 'master-1', generation: 1, usage: 0.3 })
 })
 
-it('says no Source runs when every Source is off, and states a Source missing or off', () => {
+it('names the missing main Session or foreman as a problem, and says nothing when both are open', () => {
   const host = views()
-  expect(problems(host).map(item => item.kind)).not.toContain('no-source')
+  expect(overview(host, load, { masterId: 'master-1', foreman: foremanState }).problems).toEqual([])
+  expect(overview(host, load, { missingMaster: 'D:/chief', foreman: foremanState }).problems)
+    .toEqual([{ kind: 'no-master', workspace: 'D:/chief' }])
+  // The foreman is a required role too; a replacement window does not count as missing (C-37.2).
+  expect(overview(host, load, { masterId: 'master-1', foreman: { ...foremanState, open: false } }).problems)
+    .toEqual([{ kind: 'no-foreman', workspace: 'D:/gongtou' }])
+})
+
+it('states a Source missing or off, and leaves Source problems out of the overview', () => {
+  const host = views()
   const settings = store.settings()
   store.saveSettings({ ...settings, sources: { feishu: { enabled: false, config: {} }, github: { enabled: false, config: {} },
     jira: { enabled: true, config: { site: 'acme' } } } })
-  expect(problems(host).map(item => item.kind)).toContain('no-source')
+  // Source health belongs to the deployment page; the overview names only missing roles.
+  expect(overview(host, load, {}).problems).toEqual([])
   expect(Object.fromEntries(sourcesStatus(host, {}, {}).map(source => [source.id, [source.state, source.installed]])))
     .toEqual({ feishu: ['off', true], github: ['off', true], jira: ['missing', false] })
 })
@@ -194,43 +210,39 @@ it('sends text without HTML, entity-encoded tags included, and with images named
 })
 
 it('words each settings save by what it changed from the one before, and nothing after a gap in the history', () => {
-  const host = views()
+  views()
   const first = store.settings()
-  const allowed = (entries: { id: string; name?: string }[]) => ({ ...first.policy, sources: { ...first.policy.sources,
-    feishu: { ...first.policy.sources.feishu!, allowed: entries } } })
-  const alice = { id: 'ou_alice', name: 'Alice Liu' }, bob = { id: 'ou_bob', name: 'Bob' }
-  store.saveSettings({ ...first, policy: allowed([alice, bob, { id: 'ou_carol' }]), paused: true,
-    sources: { ...first.sources, feishu: { enabled: false, config: {} } },
-    executor: { ...first.executor, directory: '/srv/work', prepare: 'npm ci', blockedCommands: ['rm', 'curl'] } })
+  store.saveSettings({ ...first, paused: true,
+    executor: { ...first.executor, model: { provider: 'p', model: 'm' }, maxWorkers: 5, directory: '/srv/work', prepare: 'npm ci',
+      blockedCommands: ['rm', 'curl'], stuckMinutes: 30 } })
   const second = store.settings()
-  store.saveSettings({ ...second, policy: allowed([alice, { id: 'ou_carol' }]), paused: false, sources: { ...second.sources,
-    feishu: { enabled: true, config: {} } } })
-  const changes = (revision: number) => policyHistory(store, host.sources, 'v').items.find(item => item.revision === revision)!.changes
+  store.saveSettings({ ...second, paused: false, executor: { ...second.executor, maxWorkers: 3 } })
+  const history = () => executionHistory(store)
+  const changes = (revision: number) => history().items.find(item => item.revision === revision)!.changes
   const revision = store.get(KV.settings.revision)!
   expect(changes(revision - 1)).toEqual([
-    { code: 'sourceRowsAdded', source: 'feishu', part: true, field: 'allowed', items: ['Bob', 'ou_carol'] },
-    { code: 'sourceRowsChanged', source: 'feishu', part: true, field: 'allowed', items: ['Alice Liu'] },
-    { code: 'paused' }, { code: 'executionDirectory', from: '', to: '/srv/work' }, { code: 'prepareCommand' },
-    { code: 'blockedCommands', from: '', to: 'rm curl' }, { code: 'sourceDisabled', source: 'feishu' }])
-  expect(changes(revision)).toEqual([{ code: 'sourceRowsRemoved', source: 'feishu', part: true, field: 'allowed', items: ['Bob'] },
-    { code: 'resumed' }, { code: 'sourceEnabled', source: 'feishu' }])
+    { code: 'executorModel' }, { code: 'maxWorkers', from: 3, to: 5 }, { code: 'paused' },
+    { code: 'executionDirectory', from: '', to: '/srv/work' }, { code: 'prepareCommand' },
+    { code: 'blockedCommands', from: '', to: 'rm curl' }, { code: 'stuckMinutes', from: 60, to: 30 }])
+  expect(changes(revision)).toEqual([{ code: 'maxWorkers', from: 5, to: 3 }, { code: 'resumed' }])
+  // Each item carries the execution block it saved, the value a rollback puts back (C-37f).
+  expect(history().items.find(item => item.revision === revision)!.executor).toEqual(store.settings().executor)
+  expect(history().items.find(item => item.revision === revision)!.paused).toBe(false)
   // A save whose predecessor is missing from the history has nothing to compare with.
   store.delete(KV.settings.version(revision))
   store.saveSettings({ ...store.settings(), paused: true })
   expect(changes(revision + 1)).toBeNull()
 })
 
-it('names a listed bot as the Policy lists it, and gives a bot\'s Mandate a basis fact of its own', () => {
+it('names a listed bot as the Policy lists it', () => {
   store.saveSettings(SettingsSchema.parse({ policy: { sources: { feishu: { allowed: [], bots: [{ id: 'cli_review', name: '评审机器人' }] } } } }))
   const sources = new SourceRegistry(() => store.settings())
   sources.register(feishuKind)
   const view = snapshot({ store, sources, links })
   expect(view.actor({ source: 'feishu', id: 'cli_review' }, false).name).toEqual({ zh: '评审机器人', en: '评审机器人' })
-  expect(basisFacts({ via: 'bot', sender: '评审机器人', addressed: 'mention', observation: { mode: 'auto' } }, view.rule).facts)
-    .toEqual([{ name: 'sender', value: '评审机器人' }, { name: 'bot' }, { name: 'addressed', value: 'mention' }, { name: 'mode', value: 'auto' }])
 })
 
-it('shows a follow-up that reached a ticket as delivered, the tickets that handed a Trigger back with why, and the Threads a ticket follows for context', () => {
+it('shows a follow-up that reached a ticket as delivered, and the tickets that handed a Trigger back with why', () => {
   const host = views()
   live('t1')
   store.threads.save({ key: 'feishu:oc_1:om_root', ref: { source: 'feishu', id: 'oc_1:om_root' }, createdAt: at, subscriptions: ['t1'],
@@ -247,27 +259,22 @@ it('shows a follow-up that reached a ticket as delivered, the tickets that hande
     handbacks: [{ ticketId: 't1', title: 't1', reason: 'Asks for a new feature' }] })
   store.threads.save({ key: 'github:7', ref: { source: 'github', id: '7' }, createdAt: at, subscriptions: ['t1'], context: ['t1'],
     correlated: [], pending: [], meta: {} })
-  expect(threadDetail(host, 'github:7', undefined, 50)?.context).toEqual(['t1'])
   store.tickets.save({ id: 't1', title: 'Fix', decisionId: 'd', channels: [], undelivered: [], createdAt: at, updatedAt: at,
     mandate: { strength: 'explicit', policyVersion: 'v', basis: { via: 'listed' }, actor: { source: 'feishu', id: 'ou_alice' }, scope: '' },
     origin: { triggerId: 'e1', triggerIds: ['e1'] }, assignments: [],
     inputs: [{ id: 'i1', kind: 'trigger', triggerId: 'f1', at }, { id: 'i2', kind: 'trigger', triggerId: 'f2', at }] })
   const page = ticketDetail(host, 't1')!
-  expect(Object.fromEntries(page.threads.map(thread => [thread.key, !!thread.context]))).toEqual({ 'feishu:oc_1:om_root': false,
-    'github:7': true })
+  // The detail names every Thread the ticket subscribes to, including one it follows only for context.
+  expect(page.threads.map(thread => thread.key).sort()).toEqual(['feishu:oc_1:om_root', 'github:7'])
   expect(page.inputs.map(input => input.kind === 'trigger' && input.trigger?.handback)).toEqual([{ reason: 'Asks for a new feature', at },
     undefined])
   expect(triggerView(snapshot(host), store.triggers.get('f2')!).disposition.handbacks[0]?.title).toBe('Fix')
 })
 
-it('names a bot\'s Mandate as a bot once the Policy no longer lists it', () => {
+it('names a bot the Policy no longer lists as its kind names a bot', () => {
   const host = views()
-  const mandate = { strength: 'inferred' as const, policyVersion: 'v', basis: { via: 'bot' as const,
-    observation: { mode: 'auto' as const } },
-    actor: { source: 'feishu', id: 'cli_removed' }, scope: '' }
-  store.tickets.save({ id: 't1', title: 'Fix', decisionId: 'd', channels: [], undelivered: [], createdAt: at, updatedAt: at, mandate,
-    origin: { triggerId: 'e1', triggerIds: ['e1'] }, assignments: [], inputs: [] })
-  expect(ticketDetail(host, 't1')!.mandate.actor).toEqual({ source: 'feishu', id: 'cli_removed', name: feishuKind.policy!.unnamed!.bot })
+  const view = snapshot(host)
+  expect(view.actor({ source: 'feishu', id: 'cli_removed' }, false).name).toEqual(feishuKind.policy!.unnamed!.bot)
 })
 
 it('offers a person to send a follow-up to Eval while a ticket decides it, or once nothing did', () => {

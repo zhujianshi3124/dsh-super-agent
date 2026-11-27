@@ -3,17 +3,16 @@ import type { Context } from '@deepseek-ai/cordis'
 import type {} from '@deepseek-ai/dsh-host-webserver'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import { z } from 'zod'
-import { THREAD_FILTERS, TICKET_FILTERS, type Api, type ApiResponse, type RouteParams } from './api.ts'
-import { sourceSkills } from './context.ts'
+import { TICKET_FILTERS, type Api, type ApiResponse, type RouteParams } from './api.ts'
 import type { ModelCatalog } from '@deepseek-ai/dsh-api-session-controller/types'
 import { PromptConflict, SKILL_NAME, SKILL_PREFIX, TEAM_SECTIONS, builtInBase, builtInParts, defaultPrompts, savePrompts, type Prompts }
   from './prompts.ts'
-import { policyVersion } from '../policy.ts'
 import { SettingsConflict, type Settings } from './settings.ts'
 import { SetupError, type SetupProblem } from '../setup.ts'
-import { UserError, type EngineForPeople, type Ticket } from '../core/index.ts'
+import { UserError, ticketStop, type EngineForPeople, type Ticket } from '../core/index.ts'
 import type { Deployment, Machine } from '../deployment.ts'
 import type { DshExecutor } from '../executor/dsh.ts'
+import type { WrapUp } from './wrapup.ts'
 import type { Health } from '../sources/host.ts'
 import type { SourceRegistry } from '../sources/registry.ts'
 import type { Sessions } from './sessions.ts'
@@ -21,11 +20,10 @@ import type { Store } from './store.ts'
 import type { TextCache } from './cache.ts'
 import type { LinkTarget, ViewHost } from './views/records.ts'
 import type { Variable } from './execution-environment.ts'
-import { policyHistory } from './settings-history.ts'
+import { executionHistory } from './settings-history.ts'
 import { overview } from './views/overview.ts'
 import { settingsView } from './views/settings.ts'
-import { sourcesStatus, type SetupState } from './views/sources.ts'
-import { decisionList, search, threadDetail, threadList } from './views/threads.ts'
+import { search } from './views/threads.ts'
 import { executorLoad, ticketDetail, ticketList } from './views/tickets.ts'
 
 export interface HttpHost {
@@ -35,12 +33,27 @@ export interface HttpHost {
   readonly sources: SourceRegistry
   readonly prompts: Pick<Prompts, 'current' | 'version' | 'history' | 'preview' | 'save' | 'defaultChanged'>
   readonly sessions: Pick<Sessions, 'status' | 'notify' | 'delivery'>
-  readonly settings: Pick<Settings, 'view' | 'save' | 'pause' | 'sync' | 'refreshLabels'>
+  readonly settings: Pick<Settings, 'view' | 'save' | 'pause'>
   readonly engine: EngineForPeople
   readonly executor: Pick<DshExecutor, 'activeCount'>
+  /** The person's wrap-up and start of work (C-17b, C-38 item 7). */
+  readonly wrapUp: Pick<WrapUp, 'status' | 'wrapUp' | 'startWork'>
   readonly health: Record<string, Health>
   readonly machine: Machine
   readonly masterId: string
+  /** The workspace the main Session runs in, named when no main Session is open (C-26b). */
+  readonly masterWorkspace: string
+  /** Whether a main Session is open right now; without one the installation says which role is missing instead of running. */
+  masterOpen(): boolean
+  /** Numbered instructions the person confirms before tickets may be created under them. */
+  readonly proposals: { list(): import('../core/index.ts').Proposal[]; view(id: string): import('../core/index.ts').Proposal }
+  /** The current foreman session, its generation, whether a rotation waits, and whether its Session is open (C-37.2, C-26b). */
+  foreman(): { session: string; generation: number; pending: boolean; usage: number | null
+    rotatedAt: string | null; open: boolean }
+  /** The ticket's current worker session, which may be a rotated generation. */
+  workerSession(ticketId: string): string
+  /** Every worker session a ticket has used, current first, so its detail shows each generation (C-29). */
+  workerSessions(ticketId: string): string[]
   /** Resolves once startup finishes or setup determines what is still missing. */
   readonly ready: Promise<void>
   /** Resolved deployment; throws if read while waiting for setup (`!configured()`). */
@@ -53,6 +66,8 @@ export interface HttpHost {
   checkSetup(): void
   requestPass(): void
   models(): Promise<ModelCatalog>
+  /** Live view of hot-swappable extensions and their hook bus. */
+  extensions(): unknown
 }
 /**
  * Represents a client-facing 400 or 404 error raised during management route parsing or lookup.
@@ -106,19 +121,39 @@ export function stateView(runtime: HttpHost) {
   const settings = runtime.store.settings()
   return { setup: setupView(runtime), load: { ...executorLoad(runtime.store, runtime.executor.activeCount()),
     maxWorkers: settings.executor.maxWorkers },
-    masterId: runtime.masterId, paused: settings.paused, health: runtime.health }
+    masterId: runtime.masterId, paused: settings.paused, wrapUp: runtime.wrapUp.status(), health: runtime.health,
+    proposals: runtime.proposals.list().slice(0, 20).map(proposal => ({ id: proposal.id, status: proposal.status,
+      tasks: proposal.tasks.length, heard: proposal.heard.slice(0, 200), ticketIds: proposal.ticketIds,
+      createdAt: proposal.createdAt, approvedAt: proposal.approvedAt ?? null, handoffAt: proposal.handoffAt ?? null,
+      dispatchedAt: proposal.dispatchedAt ?? null })).slice(0, 20),
+    foreman: runtime.foreman() }
 }
-const views = (runtime: HttpHost): ViewHost => ({ store: runtime.store, sources: runtime.sources, links: runtime.links() })
-const setupState = (runtime: HttpHost): SetupState => ({ deployment: runtime.configured() ? runtime.deployment : undefined,
-  problem: runtime.setupProblem, feishuProblem: runtime.feishuProblem })
+const views = (runtime: HttpHost): ViewHost => ({ store: runtime.store, sources: runtime.sources, links: runtime.links(), workerSession: runtime.workerSession,
+  workerSessions: runtime.workerSessions })
 export type StateView = ReturnType<typeof stateView>
+/** A variable whose name marks it as a secret shows its name only, never its value (C-37d.4). */
+const SECRET_NAME = /KEY|TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL/i
+const maskedEnvironment = (variables: Variable[]) => variables.map(variable => SECRET_NAME.test(variable.key)
+  ? { key: variable.key, value: '', masked: true } : { ...variable, masked: false })
 /** Builds a ticket's detail view; `environment` is empty while waiting for setup because it requires the resolved deployment. */
 function ticketPage(runtime: HttpHost, id: string) {
   const detail = ticketDetail(views(runtime), id), ticket = runtime.store.tickets.get(id)
   if (!detail || !ticket) throw new RouteError(404, 'Ticket not found')
-  return { ...detail, environment: runtime.configured() ? runtime.ticketEnvironment(ticket) : [] }
+  return { ...detail, environment: runtime.configured() ? maskedEnvironment(runtime.ticketEnvironment(ticket)) : [] }
 }
 export type TicketPageView = ReturnType<typeof ticketPage>
+/**
+ * One instruction as the panel shows it: the wording the person confirmed, every task it holds, and the tickets it
+ * produced with why each stopped, so the whole path from a sentence to a delivery stays readable afterwards (C-29).
+ */
+function proposalPage(runtime: HttpHost, id: string) {
+  const proposal = runtime.proposals.view(id)
+  return { ...proposal, tickets: proposal.ticketIds.map(ticketId => {
+    const ticket = runtime.store.tickets.get(ticketId)
+    return { id: ticketId, title: ticket?.title ?? '', stop: ticket ? ticketStop(ticket) ?? null : null }
+  }) }
+}
+export type ProposalPageView = ReturnType<typeof proposalPage>
 function promptsView(runtime: HttpHost, revision: number | undefined, offset: number) {
   const current = runtime.prompts.current()
   const shown = revision === undefined || revision === current.revision ? current : runtime.prompts.version(revision)
@@ -126,7 +161,7 @@ function promptsView(runtime: HttpHost, revision: number | undefined, offset: nu
   // built-in text changed since, the text they were edited from when known.
   const parts = Object.entries(builtInParts()).map(([key, part]) => ({ key, ...part, base: builtInBase(part.text) }))
   return { masterId: runtime.masterId, current: shown, defaults: defaultPrompts(), sections: TEAM_SECTIONS, skillName: SKILL_NAME.source,
-    builtin: Object.keys(sourceSkills), skillPrefix: SKILL_PREFIX, parts, defaultChanged: runtime.prompts.defaultChanged(shown.config),
+    builtin: [] as string[], skillPrefix: SKILL_PREFIX, parts, defaultChanged: runtime.prompts.defaultChanged(shown.config),
     ...runtime.sessions.status(), ...runtime.prompts.history(offset) }
 }
 export type PromptsView = ReturnType<typeof promptsView>
@@ -137,15 +172,11 @@ interface Input<K extends keyof Api> {
 type Routes = { [K in keyof Api]: (input: Input<K>) => ApiResponse<K> | Promise<ApiResponse<K>> }
 const offset = z.coerce.number().int().nonnegative().catch(0)
 const limit = (fallback: number, max: number) => z.coerce.number().int().positive().catch(fallback).transform(value => Math.min(max, value))
-const TicketsQuery = z.object({ state: z.enum(TICKET_FILTERS).catch('open'), offset, limit: limit(20, 1000) })
-const ThreadsQuery = z.object({ filter: z.enum(THREAD_FILTERS).catch('subscribed'), offset, limit: limit(20, 1000) })
-const ThreadQuery = z.object({ limit: limit(50, 100), before: z.string().optional(), around: z.string().optional() })
-const DecisionsQuery = z.object({ kind: z.string().default(''), window: z.literal('24h').optional().catch(undefined), offset,
-  limit: limit(30, 200) })
+const TicketsQuery = z.object({ state: z.enum(TICKET_FILTERS).catch('working'), offset, limit: limit(20, 1000) })
 const count = z.coerce.number().int().nonnegative()
 const PromptsQuery = z.object({ revision: count.optional(), offset: count.default(0) })
-const SourceBlock = z.templateLiteral(['source:', z.string().regex(/^[a-z][a-z0-9-]*$/)])
-const SettingsBlockSchema = z.union([z.enum(['policy', 'eval', 'executor']), SourceBlock])
+/** The panel changes the execution block only (C-37f, C-38.4); prompts and deployment have their own routes. */
+const SettingsBlockSchema = z.enum(['executor'])
 const SaveRequest = z.object({ value: z.unknown(), revision: z.number().int().nonnegative() })
 
 function routes(runtime: HttpHost): Routes {
@@ -154,54 +185,26 @@ function routes(runtime: HttpHost): Routes {
   const promptBody = (input: { body: (maxBytes?: number) => Promise<unknown> }) => input.body(4 * runtime.machine.promptMaxChars.get() + 4096)
   return {
     'GET state': () => stateView(runtime),
-    'GET overview': () => overview(views(runtime), runtime.health, policyVersion(store.settings()),
-      executorLoad(store, runtime.executor.activeCount()), runtime.setupProblem ?? runtime.feishuProblem),
+    'GET overview': () => overview(views(runtime), executorLoad(store, runtime.executor.activeCount()),
+      { masterId: runtime.masterId, missingMaster: runtime.masterOpen() ? undefined : runtime.masterWorkspace, foreman: runtime.foreman() }),
     'GET search': ({ query }) => search(views(runtime), query.q ?? '', runtime.sourceLinks),
-    'GET sources': () => sourcesStatus(views(runtime), runtime.health, setupState(runtime)),
-    'GET settings': () => settingsView(store, runtime.sources, runtime.health, setupState(runtime), runtime.machine.stateDir),
-    'POST sources/:id/labels': ({ params }) => runtime.settings.refreshLabels(params.id),
-    'GET threads': ({ query }) => {
-      const { filter, offset, limit } = ThreadsQuery.parse(query)
-      return threadList(views(runtime), filter, offset, limit)
-    },
-    'GET threads/:key': ({ params, query }) => {
-      const { limit, before, around } = ThreadQuery.parse(query)
-      const detail = threadDetail(views(runtime), params.key, before, limit, around)
-      if (!detail) throw new RouteError(404, 'Thread not found')
-      return detail
-    },
-    'POST threads/:key/unsubscribe': async ({ params }) => {
-      const removed = runtime.engine.unsubscribe(params.key)
-      return { removed, thread: params.key, context_delivery: await runtime.sessions.delivery(`subscription:${params.key}`) }
-    },
-    'POST triggers/:id/requeue': ({ params }) => {
-      const queued = runtime.engine.reevaluate(params.id)
-      runtime.requestPass()
-      return { queued }
-    },
-    'GET decisions': ({ query }) => {
-      const { kind, window, offset, limit } = DecisionsQuery.parse(query)
-      const since = window ? new Date(Date.now() - 86_400_000).toISOString() : ''
-      return decisionList(views(runtime), kind.split(',').filter(Boolean), offset, limit, since)
-    },
-    'POST decisions/:id/dismiss': ({ params }) => { runtime.engine.dismiss(params.id); return { dismissed: true } },
+    'GET settings': () => settingsView(store, runtime.machine.stateDir),
     'GET tickets': ({ query }) => {
       const { state, offset, limit } = TicketsQuery.parse(query)
       return ticketList(views(runtime), state, offset, limit)
     },
     'GET tickets/:id': ({ params }) => ticketPage(runtime, params.id),
-    'POST tickets/:id/retry': ({ params }) => { const id = ticket(params.id); runtime.engine.retryTicket(id); return { retried: true } },
+    'GET proposals/:id': ({ params }) => proposalPage(runtime, params.id),
     'POST tickets/:id/stop': ({ params }) => { const id = ticket(params.id); runtime.engine.stopTicket(id); return { stopped: true } },
     'POST executor/pause': async ({ body }) => runtime.settings.pause(z.object({ paused: z.boolean() }).parse(await body()).paused, 'panel'),
+    'POST executor/wrapup': () => runtime.wrapUp.wrapUp(),
+    'POST executor/startwork': () => runtime.wrapUp.startWork(),
     'PUT settings/:block': async ({ params, body }) => {
       const block = SettingsBlockSchema.parse(params.block)
-      const known = !block.startsWith('source:') || runtime.sources.instances().some(instance => `source:${instance.id}` === block)
-      if (!known) throw new RouteError(404, 'Source not found')
       const request = SaveRequest.parse(await body())
       return runtime.settings.save(block, request.value, request.revision, 'panel')
     },
-    'GET policy/history': () => policyHistory(store, runtime.sources, policyVersion(store.settings())),
-    'POST policy-sync/:id': async ({ params }) => ({ policy: await runtime.settings.sync(params.id) }),
+    'GET settings/history': () => executionHistory(store),
     'POST setup/check': () => { runtime.checkSetup(); return { restarting: true } },
     'GET models': () => runtime.models(),
     'GET prompts': ({ query }) => { const { revision, offset } = PromptsQuery.parse(query); return promptsView(runtime, revision, offset) },
@@ -237,6 +240,9 @@ export function registerHttp(ctx: Context, runtime: HttpHost): () => void {
       if (!sameOrigin(req, ctx.webServer.port)) { json(res, 403, { error: 'Same-origin management request required' }); return }
       try {
         await runtime.ready
+        if (url.pathname === '/orchestrator/api/extensions' && (req.method ?? 'GET') === 'GET') {
+          json(res, 200, runtime.extensions()); return
+        }
         const route = match(table, req.method ?? 'GET', url.pathname.slice('/orchestrator/api/'.length).split('/'))
         if (!route) throw new RouteError(404, 'Unknown operation')
         const query = Object.fromEntries(url.searchParams)

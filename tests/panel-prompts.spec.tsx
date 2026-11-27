@@ -19,7 +19,7 @@ it('lists the team sections, then the built-in parts, edits and saves them separ
   await click(tab(zh.promptViewFull))
   // The full prompt shows every part, team or built in, as editable, in the order the Session reads them.
   const parts = all('.dt-preview-part').map(part => [part.querySelector('b')?.textContent, part.hasAttribute('data-editable')])
-  expect(parts.slice(0, 5)).toEqual([['共享约定', true], ['主 Session 角色', true], ['沟通方式', true], ['工单范围', true], ['交付要求', true]])
+  expect(parts.slice(0, 5)).toEqual([['共享约定', true], ['主会话角色', true], ['沟通方式', true], ['工单范围', true], ['交付要求', true]])
   expect(text()).toContain('Custom communication rule')
   await click(all('.dt-preview-part').find(part => part.querySelector('b')?.textContent === '沟通方式')!.querySelector('button')!)
   await click(zh.promptResetSection)
@@ -42,22 +42,29 @@ it('keeps a conflicting prompt draft, rebases it onto the newer version and save
   expect(server.prompts.current.config).toMatchObject({ communication: 'Mine', scope: 'Theirs' })
 })
 
-it('shows a built-in skill with the CLI notes in the full prompt, editable as a built-in part, and adds a team skill but no skill under a built-in name', async () => {
+it('ships no built-in skills, and adds a team skill the full prompt shows under its prefixed name', async () => {
   at({ page: 'settings', query: { group: 'prompts' } })
   await mount()
+  // The installation ships no Source skills (C-06); only team skills exist.
+  expect(server.prompts.builtin).toEqual([])
   await click(tab(zh.promptViewFull))
-  await act(async () => { const select = field<HTMLSelectElement>(zh.promptPreviewTarget); select.value = 'skill/github'; select.dispatchEvent(new Event('change', { bubbles: true })) }); await settle()
-  expect(text()).toContain('## CLI usage')
-  expect(all('.dt-preview-part[data-editable] b').map(name => name.textContent)).toEqual([zh['promptPart.skill/github']])
+  expect([...field<HTMLSelectElement>(zh.promptPreviewTarget).options].map(option => option.value)).toEqual(['orchestrator', 'worker'])
   await click(tab(zh.promptViewEdit))
-  for (const name of ['Bad Name', 'github']) {
-    await type(field<HTMLInputElement>(zh.promptAddSkill), name)
-    await click(zh.promptAddSkillAction)
-    expect(document.querySelector('[role="alert"]')?.textContent).toBe(zh.promptSkillNameInvalid)
-  }
+  await type(field<HTMLInputElement>(zh.promptAddSkill), 'Bad Name')
+  await click(zh.promptAddSkillAction)
+  expect(document.querySelector('[role="alert"]')?.textContent).toBe(zh.promptSkillNameInvalid)
   await type(field<HTMLInputElement>(zh.promptAddSkill), 'testing')
   await click(zh.promptAddSkillAction)
   expect(all('.dt-nav-item').map(item => item.textContent)).toContain('dsh-superagent-testing')
+  // A name already taken is refused too.
+  await type(field<HTMLInputElement>(zh.promptAddSkill), 'testing')
+  await click(zh.promptAddSkillAction)
+  expect(document.querySelector('[role="alert"]')?.textContent).toBe(zh.promptSkillNameInvalid)
+  await type(field<HTMLTextAreaElement>(zh.promptBody), '## Testing\nRun the suite.')
+  await click(tab(zh.promptViewFull))
+  await act(async () => { const select = field<HTMLSelectElement>(zh.promptPreviewTarget); select.value = 'skill/testing'; select.dispatchEvent(new Event('change', { bubbles: true })) }); await settle()
+  expect(text()).toContain('## Testing')
+  expect(all('.dt-preview-part[data-editable] b').map(name => name.textContent)).toEqual(['dsh-superagent-testing'])
 })
 
 it('loads all defaults into the draft from the history without saving them', async () => {
@@ -136,16 +143,16 @@ it('edits a built-in part as an override of its built-in text, marks it changed,
 it('says which placeholders a template keeps', async () => {
   at({ page: 'settings', query: { group: 'prompts' } })
   await mount()
-  await click(builtInItem(zh['promptPart.runtime/policy']))
-  expect(text()).toContain('这是模板：保留占位符 {version}、{mode}、{rules}，由系统填入内容。')
-  expect(text()).toContain(zh['promptReadBy.orchestrator'])
+  await click(builtInItem(zh['promptPart.runtime/environment']))
+  expect(text()).toContain('这是模板：保留占位符 {variables}，由系统填入内容。')
+  expect(text()).toContain(zh['promptReadBy.both'])
 })
 
 it('marks an override whose built-in text an upgrade changed, shows how it changed, and keeps the team\'s text or takes the new one', async () => {
   const dispatch = builtInParts()['runtime/dispatch']!
-  const overrides = { 'runtime/dispatch': { text: '## dispatch\nOur routing.', base: builtInBase('## dispatch\nThe old routing.') } }
+  const overrides = { 'runtime/dispatch': { text: '## Dispatch\nOur routing.', base: builtInBase('## Dispatch\nThe old routing.') } }
   server.prompts.revision = 1; server.prompts.current = promptVersion(1, { ...defaultPrompts(), overrides })
-  server.prompts.defaultChanged = [{ part: 'runtime/dispatch', base: overrides['runtime/dispatch'].base, previous: '## dispatch\nThe old routing.' }]
+  server.prompts.defaultChanged = [{ part: 'runtime/dispatch', base: overrides['runtime/dispatch'].base, previous: '## Dispatch\nThe old routing.' }]
   at({ page: 'settings', query: { group: 'prompts' } })
   await mount()
   expect(all('.dt-prompt-nav .dt-updated-tag').map(tag => tag.closest('.dt-nav-item')!.querySelector('span')!.firstChild?.textContent))
@@ -156,7 +163,7 @@ it('marks an override whose built-in text an upgrade changed, shows how it chang
   expect(box()!.textContent).toContain('下面是默认内容的变化。')
   expect([...box()!.querySelectorAll('del')].map(line => line.textContent)).toEqual(['The old routing.\n'])
   expect(box()!.querySelectorAll('ins').length).toBeGreaterThan(0)
-  expect(field<HTMLTextAreaElement>(zh.promptBody).value).toBe('## dispatch\nOur routing.')
+  expect(field<HTMLTextAreaElement>(zh.promptBody).value).toBe('## Dispatch\nOur routing.')
   // Taking the new built-in text drops the override.
   await click(zh.promptTakeDefault)
   expect(field<HTMLTextAreaElement>(zh.promptBody).value).toBe(dispatch.text)
@@ -167,15 +174,15 @@ it('marks an override whose built-in text an upgrade changed, shows how it chang
   await click(zh.promptKeepMine)
   expect(all('.dt-default-updated')).toHaveLength(0)
   await click(zh.save)
-  expect(server.prompts.current.config.overrides).toEqual({ 'runtime/dispatch': { text: '## dispatch\nOur routing.', base: builtInBase(dispatch.text) } })
+  expect(server.prompts.current.config.overrides).toEqual({ 'runtime/dispatch': { text: '## Dispatch\nOur routing.', base: builtInBase(dispatch.text) } })
 })
 
 it('shows the team\'s text against the new default when the default it was edited from is not known, or is another one', async () => {
   const dispatch = builtInParts()['runtime/dispatch']!
   // The override was restored from an older version: its base is not the one the changed default was found for.
-  const overrides = { 'runtime/dispatch': { text: '## dispatch\nOur routing.', base: 'restored' } }
+  const overrides = { 'runtime/dispatch': { text: '## Dispatch\nOur routing.', base: 'restored' } }
   server.prompts.revision = 1; server.prompts.current = promptVersion(1, { ...defaultPrompts(), overrides })
-  server.prompts.defaultChanged = [{ part: 'runtime/dispatch', base: 'another', previous: '## dispatch\nThe old routing.' }]
+  server.prompts.defaultChanged = [{ part: 'runtime/dispatch', base: 'another', previous: '## Dispatch\nThe old routing.' }]
   at({ page: 'settings', query: { group: 'prompts' } })
   await mount()
   await click(builtInItem(zh['promptPart.runtime/dispatch']))
@@ -210,10 +217,10 @@ it('shows a draft\'s template of a generated part filled, and names a part by it
   const environment = all('.dt-preview-part').find(part => part.querySelector('b')?.textContent === zh['promptPart.runtime/environment'])!
   expect(environment.querySelector('pre')?.textContent).toBe('Where you work:\n')
   await click(tab(zh.promptViewEdit))
-  await click(builtInItem(zh['promptPart.runtime/policy']))
-  await type(field<HTMLTextAreaElement>(zh.promptBody), '## Policy\n{version} {mode}')
+  await click(builtInItem(zh['promptPart.runtime/environment']))
+  await type(field<HTMLTextAreaElement>(zh.promptBody), '## Environment\nno placeholder here')
   await click(zh.save)
-  expect(text()).toContain(`「${zh['promptPart.runtime/policy']}」的模板必须保留占位符 {rules}`)
+  expect(text()).toContain(`「${zh['promptPart.runtime/environment']}」的模板必须保留占位符 {variables}`)
 })
 
 it('lists the overrides of parts this version no longer has, which the next save drops', async () => {

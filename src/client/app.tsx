@@ -1,22 +1,20 @@
-/** Root panel shell: header with global search and glossary, top-level navigation tabs, and active route view. */
+/** Root panel shell (C-36): header with search, glossary and open-main-Session (C-37g), three tabs, and the active route view.
+ * The instruction detail opens from the overview and keeps that tab selected; it is not a tab of its own. */
 import { useCallback, useEffect, useRef, useState, type FormEvent, type ReactNode } from 'react'
 import type { SearchView } from './api.ts'
 import { Button, Dot, Icon, Input, Modal, SegmentedTabs } from './controls.tsx'
 import type { DeploymentForm } from './deployment.tsx'
-import { EvalStatus } from './eval.tsx'
 import { ExecutionStatus } from './execution.tsx'
 import { ticketMark } from './marks.ts'
 import { GLOSSARY, GLOSSARY_VALUES, en, zh, type DshSuperagentKey } from './locales.ts'
 import { OverviewPage } from './overview.tsx'
 import { PanelProvider, usePanel, usePanelData } from './provider.tsx'
+import { ProposalPage } from './proposal.tsx'
 import { HOME, TABS, initialLocation, lastSettingsGroup, remember, routeLabel, settingsRoute, type Location, type Route,
   type Tab } from './route.ts'
 import { SettingsPage } from './settings.tsx'
-import { SourceStatus } from './source.tsx'
 import { actorName, errorText, reasonLabel, valueLabel, type T, readableMarkers } from './text.ts'
-import { ThreadPage } from './thread.tsx'
 import { TicketPage } from './ticket.tsx'
-import { TriggerStatus } from './trigger.tsx'
 import { When } from './widgets.tsx'
 
 export interface AppProps {
@@ -28,7 +26,6 @@ function Glossary({ open, onClose }: { open: boolean; onClose: () => void }) {
   const { t } = usePanel()
   const chinese = t('tab.overview') === zh['tab.overview']
   const [own, other] = chinese ? [zh, en] : [en, zh]
-  const heading = (group: keyof typeof GLOSSARY) => t(group === 'roles' ? 'glossaryGroup.roles' : `tab.${group}`)
   return <Modal className="dt-glossary-modal" open={open} onClose={onClose} title={t('glossary')} closeLabel={t('close')}
     description={t('glossaryIntro')} footer={<Button variant="primary" onClick={onClose}>{t('close')}</Button>}>
     <div className="dt-glossary-body">
@@ -38,7 +35,7 @@ function Glossary({ open, onClose }: { open: boolean; onClose: () => void }) {
           <th>{t('glossaryMeaning')}</th>
         </tr></thead>
         {Object.entries(GLOSSARY).map(([group, keys]) => <tbody key={group}>
-          <tr><th colSpan={3} scope="rowgroup" className="dt-glossary-group">{heading(group as keyof typeof GLOSSARY)}</th></tr>
+          <tr><th colSpan={3} scope="rowgroup" className="dt-glossary-group">{t(`glossaryGroup.${group as keyof typeof GLOSSARY}`)}</th></tr>
           {keys.map(key => <tr key={key}><td>{own[`term.${key}`]}</td><td>{other[`term.${key}`]}</td><td>{own[`meaning.${key}`]}</td></tr>)}
         </tbody>)}
       </table>
@@ -65,31 +62,32 @@ function Result({ name, open, children }: { name: ReactNode; open: (() => void) 
     <div className="dt-row-meta">{children}</div>
   </div></li>
 }
+/** Search results (C-37g, C-29): tickets, instructions, and the person's own messages, each opening its detail. */
 function SearchResults({ result, query, onClose }: { result: SearchView; query: string; onClose: () => void }) {
   const { t, navigate } = usePanel()
-  const { setup } = usePanelData()
-  const empty = !result.items.length && !result.threads.length && !result.tickets.length
-  const counts = { tickets: result.tickets.length, threads: result.threads.length, items: result.items.length }
+  const empty = !result.items.length && !result.tickets.length && !result.proposals.length
+  const counts = { tickets: result.tickets.length, proposals: result.proposals.length, items: result.items.length }
   const go = (route: Route) => () => { onClose(); navigate(route) }
   return <div className="dt-search-results" role="region" aria-label={t('searchLabel')}>
     <div className="dt-search-head">
-      <span className="dt-hint">{empty ? t(setup?.accounts?.feishu ? 'searchNone' : 'searchNoneGithub')
+      <span className="dt-hint">{empty ? t('searchNone')
         : t(result.items.length >= 20 ? 'searchFoundCapped' : 'searchFound', counts)}</span>
       <Button variant="ghost" size="sm" icon={<Icon name="close" size={14} />} aria-label={t('close')} onClick={onClose} />
     </div>
     {!empty && <ul className="dt-list">
       {result.tickets.map(ticket => <Result key={ticket.id} name={<Highlight text={ticket.title} query={query} />}
         open={go({ page: 'execution', id: ticket.id })}>
-        <span>{t('term.ticket')}</span><span>{ticket.stage === 'ended' ? t('ticket.ended') : ticketMark(t, ticket).label}</span>
+        <span>{t('term.ticket')}</span><span className="dt-mono">{ticket.id}</span><span>{ticketMark(t, ticket).label}</span>
       </Result>)}
-      {result.threads.map(thread => <Result key={thread.key} name={readableMarkers(t, thread.title)} open={go({ page: 'trigger',
-        id: thread.key })}>
-        <span>{t('term.thread')}</span>
+      {result.proposals.map(proposal => <Result key={proposal.id} name={<Highlight text={proposal.heard} query={query} />}
+        open={go({ page: 'proposal', id: proposal.id })}>
+        <span>{t('term.proposal')}</span><span className="dt-mono">{proposal.id}</span>
+        <span>{t(`proposalStatus.${proposal.status}`)}</span><span>{t('proposalTasksCount', { count: proposal.tasks })}</span>
       </Result>)}
-      {/* Filtered triggers have no Thread and display their filter reason instead of a link. */}
+      {/* Own words: open the ticket the message reached, when there is one; filtered messages show their reason instead. */}
       {result.items.map(item => <Result key={item.id} name={<Highlight text={readableMarkers(t, item.preview) || t('empty')}
         query={query} />}
-        open={item.filtered === undefined ? go({ page: 'trigger', id: item.threads[0]!, query: { trigger: item.id } }) : undefined}>
+        open={item.disposition.fanout[0] ? go({ page: 'execution', id: item.disposition.fanout[0] }) : undefined}>
         <span>{valueLabel(t, 'source', item.source)}</span><span>{actorName(t, item.actor)}</span><When at={item.at} />
         {item.threadTitle && <span className="dt-ellipsis">{t('inThread', { thread: readableMarkers(t, item.threadTitle) })}</span>}
         {item.filtered !== undefined && <span>{t('searchFiltered', { reason: reasonLabel(t, item.filtered) })}</span>}
@@ -142,19 +140,16 @@ function Pages({ route, openTab, deploymentForm }: { route: Route; openTab: (tab
   const { t } = usePanel()
   const { state, error, reload } = usePanelData()
   // Keep the active tab scrolled into view on narrow screens when routes change via links.
-  useEffect(() => { document.getElementById(`dt-tab-${route.page}`)?.scrollIntoView?.({ block: 'nearest', inline: 'nearest' }) }, [route.page])
+  useEffect(() => { document.getElementById(`dt-tab-${route.page === 'proposal' ? 'overview' : route.page}`)?.scrollIntoView?.({ block: 'nearest', inline: 'nearest' }) }, [route.page])
   const waiting = error ? <p className="dt-error" role="alert">{error.message}</p> : <p className="dt-hint">{t('loading')}</p>
   const page = (() => {
     switch (route.page) {
       case 'overview': return <OverviewPage />
-      case 'source': return <SourceStatus />
-      case 'trigger': return route.id !== undefined ? <ThreadPage key={route.id} id={route.id} target={route.query?.trigger} />
-        : <TriggerStatus filter={route.query?.filter ?? 'subscribed'} />
-      case 'eval': return <EvalStatus filter={route.query?.filter ?? 'work'} window={route.query?.window}
-        paused={!!state?.paused} />
       case 'execution': return route.id !== undefined ? <TicketPage key={route.id} id={route.id} />
-        : state ? <ExecutionStatus filter={route.query?.filter ?? 'open'} state={state} reload={reload} /> : waiting
-      case 'settings': return state ? <SettingsPage key={state.masterId} group={route.query.group} query={route.query} state={state}
+        : state ? <ExecutionStatus filter={route.query?.filter ?? 'working'} state={state} reload={reload} /> : waiting
+      // An instruction has no tab of its own: it opens from the overview and keeps that tab selected.
+      case 'proposal': return <ProposalPage key={route.id} id={route.id} />
+      case 'settings': return state ? <SettingsPage key={state.masterId} group={route.query.group} state={state}
         deploymentForm={deploymentForm} /> : waiting
     }
   })()
@@ -162,9 +157,9 @@ function Pages({ route, openTab, deploymentForm }: { route: Route; openTab: (tab
     <div className="dt-column">
       <Header masterId={state?.masterId} />
       {error && state && <p className="dt-error" role="status">{error.message}</p>}
-      <SegmentedTabs className="dt-tabs" label={t('pagesLabel')} value={route.page} onChange={openTab}
+      <SegmentedTabs className="dt-tabs" label={t('pagesLabel')} value={route.page === 'proposal' ? 'overview' : route.page} onChange={openTab}
         items={TABS.map(value => ({ value, label: t(`tab.${value}`), id: `dt-tab-${value}`, panelId: 'dt-page' }))} />
-      <main id="dt-page" role="tabpanel" aria-labelledby={`dt-tab-${route.page}`} className="dt-main">{page}</main>
+      <main id="dt-page" role="tabpanel" aria-labelledby={`dt-tab-${route.page === 'proposal' ? 'overview' : route.page}`} className="dt-main">{page}</main>
     </div>
   </div>
 }

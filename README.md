@@ -1,4 +1,25 @@
-# dsh-superagent
+# dsh-super-agent
+
+> **关于本仓库 / About this repository**
+>
+> 本仓库基于 DeepSeek Harness 团队以 MIT 协议开源的 [deepseek-ai/dsh-superagent-prototype](https://github.com/deepseek-ai/dsh-superagent-prototype) 修改而来，由个人维护，与 DeepSeek 官方无关，也不是官方产品。上游的版权声明保留在 [LICENSE](LICENSE) 里。
+>
+> This is an independently maintained, modified version of [deepseek-ai/dsh-superagent-prototype](https://github.com/deepseek-ai/dsh-superagent-prototype), which the DeepSeek Harness Team released under the MIT License. It is not affiliated with or endorsed by DeepSeek. The upstream copyright notice is kept in [LICENSE](LICENSE).
+
+## 相对上游的主要改动 / Changes from upstream
+
+- 主会话（chief）来源：在自己开的主会话里直接交代任务，确认后变成工单。
+- 指令清单（proposal）：先起草任务和完成标准，用户确认后才派工单。
+- 工头（foreman）会话：拆单、派单、调度；上下文到阈值或卡住时换代交接。
+- 收工 / 开工、卡住判定、半路停下的工单续跑、工头回合被打断时自动重投。
+- 上下文守卫扩展 `extensions/context-guard`，以及 Windows 下的开关、守护、卸载脚本 `scripts/superagent-*.ps1`。
+- 默认目录按 Windows 设定：主会话 `D:\chief`（部署设置可改），工头固定 `D:\gongtou`，工人默认 `D:\buzhiding`（执行设置可改）。
+
+In short: a main-Session (chief) Source, confirmed instruction lists, a rotating foreman Session, wrap-up / resume, stuck handling, a context-guard extension and Windows helper scripts. Default directories are Windows paths (see above).
+
+以下是上游 README 原文，安装和文档部分同样适用于本仓库。 / The rest of this README is the upstream text.
+
+---
 
 > **Research prototype for reference only, not an official DeepSeek product.** This code grew out of our team's day-to-day development work, with much of the engineering done by coding agents. Treat it as research code, not production-ready software. It may still contain bugs, and its coding style and engineering practices may be inconsistent. Review and adapt it before using it in your own environment.
 >

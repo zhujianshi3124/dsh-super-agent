@@ -1,5 +1,5 @@
 /** Compact, bounded model-facing projections of triggers, tickets, threads, and decisions; full texts stay behind readable resources. */
-import { latestReport, reasonText, threadKey, ticketStage, type Decision, type Mandate, type Thread, type Ticket, type TicketInput,
+import { latestReport, reasonText, threadKey, ticketStage, ticketStop, type Decision, type Mandate, type Thread, type Ticket, type TicketInput,
   type Trigger, type TriggerDisposition } from '../core/index.ts'
 import { pullOf } from '../sources/github-pull.ts'
 import { batchLine, inputResource } from '../executor/dsh.ts'
@@ -13,20 +13,19 @@ export function triggerCard(trigger: Trigger, disposition?: TriggerDisposition) 
       ...(disposition.decisionId ? { decision_id: disposition.decisionId } : {}),
       delivered_to: disposition.fanout } } : {}) }
 }
-/** The states a ticket card shows: an open ticket's stage (docs/003), and an ended ticket's outcome. */
-export const TICKET_STATES = ['person/delivery', 'person/answer', 'person/review', 'person/blocked', 'person/failed', 'working', 'working/queued', 'idle',
-  'completed', 'merged', 'closed', 'dropped', 'stopped'] as const
+/** The states a ticket card shows: how an open ticket works (N-07), and why a stopped ticket stopped (N-13). */
+export const TICKET_STATES = ['working', 'queued', 'adjudication', 'idle',
+  'delivered', 'user-stopped', 'stuck', 'emergency', 'session-stopped', 'wrapped', 'failed'] as const
 export type TicketCardState = typeof TICKET_STATES[number]
 function cardState(ticket: Ticket): TicketCardState {
-  if (ticket.ended) return ticket.ended.outcome
-  const stage = ticketStage(ticket)
-  if (stage.stage === 'person') return `person/${stage.action}`
-  return stage.stage === 'idle' ? 'idle' : stage.stage === 'working' && stage.action ? 'working/queued' : 'working'
+  if (ticket.ended) return ticketStop(ticket) ?? 'failed'
+  return ticketStage(ticket).stage as TicketCardState
 }
 export function ticketCard(ticket: Ticket) {
-  const ended = ticket.ended && { at: ticket.ended.at, by: ticket.ended.by, reason: ticket.ended.reason ?? ticket.ended.outcome }
+  const ended = ticket.ended && { at: ticket.ended.at, by: ticket.ended.by, stop: ticketStop(ticket), reason: ticket.ended.reason ?? ticket.ended.outcome }
   const { attention } = ticket
   return { ticket_id: ticket.id, title: ticket.title, state: cardState(ticket), strength: ticket.mandate.strength,
+    ...(ticket.proposal ? { proposal: ticket.proposal, task: ticket.task } : {}),
     ...(pullOf(ticket) ? { pr_number: pullOf(ticket) } : {}), ...(ended ? { ended } : {}),
     ...(attention ? { attention: { question: attention.question, ...attention.triggerId ? { trigger_id: attention.triggerId } : {} } } : {}),
     preview: preview(latestReport(ticket)?.summary ?? ''), read: `ticket/${ticket.id}` }
@@ -62,6 +61,11 @@ export function ticketDetails(ticket: Ticket, threads: TicketThread[], batch: re
   const { preview: _preview, ...card } = ticketCard(ticket)
   return { ...card, trigger_id: ticket.origin.triggerId, ...batch.length ? { batch: batch.map(batchLine) } : {},
     ...worker ? {} : { decision_id: ticket.decisionId }, threads, directory: ticket.execution?.directory,
+    ...ticket.execution?.workspace ? { workspace: ticket.execution.workspace } : {},
+    ...ticket.decisions?.length ? { decisions: ticket.decisions } : {},
+    ...ticket.criteria?.length ? { criteria: ticket.criteria } : {},
+    ...ticket.continues ? { continues: ticket.continues } : {},
+    ...ticket.waitingFor ? { waiting_for: ticket.waitingFor } : {},
     scope: ticket.mandate.scope, requested_by: ticket.mandate.actor.id,
     assignments: newestPage(ticket.assignments, 0, ASSIGNMENTS, item => assignmentLine(ticket, item), `ticket/${ticket.id}/assignments`),
     inputs: newestPage(ticket.inputs, 0, INPUTS, input => inputLine(ticket, input, worker), `ticket/${ticket.id}/inputs`),

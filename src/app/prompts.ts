@@ -1,8 +1,8 @@
 /** Manages versioned role prompts, behavioral policies, and operational skills independently of access settings. */
 import { z } from 'zod'
 import { UserError, key } from '../core/index.ts'
-import { policyVersion, type Settings, type SettingsOrigin } from '../policy.ts'
-import { masterPrompt, workerPrompt, sharedPrompt, guides, mainAdmissionPolicy, handoffPolicy, teamDefaults, sourceSkills, cliNotes } from './context.ts'
+import type { SettingsOrigin } from '../policy.ts'
+import { foremanPrompt, masterPrompt, workerPrompt, sharedPrompt, guides, handoffPolicy, teamDefaults } from './context.ts'
 import { environmentLines, type Variable } from './execution-environment.ts'
 import { promptsNotice } from './notices.ts'
 import type { Sessions } from './sessions.ts'
@@ -18,12 +18,10 @@ const TEAM_HEADINGS: Record<TeamSection, string> = { communication: 'Communicati
 export const SKILL_NAME = /^[a-z][a-z0-9-]*$/
 /** Prefix prepended to skill names when registering them in DSH Sessions. */
 export const SKILL_PREFIX = 'dsh-superagent-'
-const SkillNameSchema = z.string().regex(SKILL_NAME).refine(name => !(Object.keys(sourceSkills) as string[]).includes(name),
-  'This name belongs to a built-in skill')
-/** The built-in parts a team may override, by key: both roles' parts, the Source skills, and the generated parts' templates. */
-const PART_KEYS = ['runtime/shared', 'runtime/orchestrator', 'runtime/worker', 'runtime/subscriptions', 'runtime/replies',
-  'runtime/dispatch', 'runtime/work', 'runtime/admission', 'runtime/handoff/orchestrator', 'runtime/handoff/worker', 'runtime/environment',
-  'runtime/policy', 'runtime/policy/none', 'skill/feishu', 'skill/github'] as const
+const SkillNameSchema = z.string().regex(SKILL_NAME)
+/** The built-in parts a team may override, by key: both roles' parts and the generated environment template. */
+const PART_KEYS = ['runtime/shared', 'runtime/orchestrator', 'runtime/worker', 'runtime/inputs', 'runtime/reporting',
+  'runtime/dispatch', 'runtime/work', 'runtime/handoff/orchestrator', 'runtime/handoff/worker', 'runtime/environment'] as const
 export type PartKey = typeof PART_KEYS[number]
 /** A team's text for a built-in part, and `base`, the key of the built-in text it was edited from. */
 const OverrideSchema = z.object({ text: z.string(),
@@ -42,7 +40,6 @@ export interface PromptVersion { revision: number; previousRevision: number | nu
 export const defaultPrompts = (): PromptConfig => ({ ...teamDefaults, skills: {} })
 
 const ENVIRONMENT_HEADING = 'Execution environment (from this installation\'s settings; it takes precedence over any repository or account named elsewhere in these instructions; an empty value means that part is not configured here). The prepare command of a ticket directory reads the same variables:'
-const POLICY_HEAD = '## Policy\nPolicy version {version}; accept mode {mode}. The accept mode and the rules decide proactive candidates only: an explicit request is routed as dispatch says, in any mode and whatever the rules.'
 type Role = 'orchestrator' | 'worker'
 /** A built-in part a team may override: the roles that read it, its text, and the placeholders a template's override keeps. */
 interface BuiltInPart { roles: readonly Role[]; text: string; placeholders?: readonly string[] }
@@ -55,18 +52,12 @@ let parts: Readonly<Record<PartKey, BuiltInPart>> | undefined
 export const builtInParts = (): Readonly<Record<PartKey, BuiltInPart>> => parts ??= {
   'runtime/shared': { roles: BOTH, text: sharedPrompt }, 'runtime/orchestrator': { roles: MAIN, text: masterPrompt },
   'runtime/worker': { roles: WORKER, text: workerPrompt },
-  'runtime/subscriptions': { roles: BOTH, text: `## subscriptions\n${guides.subscriptions}` },
-  'runtime/replies': { roles: BOTH, text: `## replies\n${guides.replies}` },
-  'runtime/dispatch': { roles: MAIN, text: `## dispatch\n${guides.dispatch}` }, 'runtime/work': { roles: WORKER, text: `## work\n${guides.work}` },
-  'runtime/admission': { roles: MAIN, text: mainAdmissionPolicy },
+  'runtime/inputs': { roles: BOTH, text: `## Inputs\n${guides.inputs}` },
+  'runtime/reporting': { roles: BOTH, text: `## Reporting\n${guides.reporting}` },
+  'runtime/dispatch': { roles: MAIN, text: `## Dispatch\n${guides.dispatch}` }, 'runtime/work': { roles: WORKER, text: `## Work\n${guides.work}` },
   'runtime/handoff/orchestrator': { roles: MAIN, text: handoffPolicy('orchestrator') },
   'runtime/handoff/worker': { roles: WORKER, text: handoffPolicy('worker') },
   'runtime/environment': { roles: BOTH, text: `${ENVIRONMENT_HEADING}\n{variables}`, placeholders: ['{variables}'] },
-  'runtime/policy': { roles: MAIN, text: `${POLICY_HEAD} The enabled rules, by name and id:\n{rules}`, placeholders: ['{version}', '{mode}', '{rules}'] },
-  'runtime/policy/none': { roles: MAIN, text: `${POLICY_HEAD} No rule is enabled: a proactive candidate can only be ignored.`,
-    placeholders: ['{version}', '{mode}'] },
-  'skill/feishu': { roles: BOTH, text: `${sourceSkills.feishu}\n\n## CLI usage\n${cliNotes}` },
-  'skill/github': { roles: BOTH, text: `${sourceSkills.github}\n\n## CLI usage\n${cliNotes}` },
 }
 /** The key of a built-in text, which an override's `base` records. */
 export const builtInBase = (text: string): string => key('prompt-built-in', text)
@@ -85,21 +76,18 @@ export function environmentSection(config: PromptConfig, variables: Variable[] |
     : 'Execution environment: dsh-superagent is waiting for setup; the management panel names what is missing.'
 }
 /**
- * The main Session's Policy section: the Policy version and accept mode it judges proactive candidates by, and every enabled
- * rule, as the settings hold them, each on one line, so a line of an instruction reads as no rule or heading of its own; the
- * settings bound each instruction (`LIMITS.ruleInstruction`). `key` names the template it was filled from.
+ * Assemble a role's system prompt sections in order from fixed templates, team sections and the generated execution
+ * environment.
  */
-export function policySection(settings: Settings, config: PromptConfig = defaultPrompts()): { key: string; text: string } {
-  const line = (text: string) => text.replace(/\s*\n\s*/g, ' ')
-  const rules = settings.policy.rules.filter(rule => rule.enabled).map(({ id, name, instruction }) => `- ${line(name)} (${id}): ${line(instruction)}`)
-  const part = rules.length ? 'runtime/policy' : 'runtime/policy/none'
-  return { key: part, text: fill(builtIn(config, part), { version: policyVersion(settings), mode: settings.eval.mode, rules: rules.join('\n') }) }
-}
-/**
- * Assemble a role's system prompt sections in order from fixed templates, team sections, the generated execution environment
- * and, last, the main Session's generated Policy section, which nothing follows, and whose change leaves the rest unchanged.
- */
-export function promptParts(config: PromptConfig, role: Role, environment?: string, policy?: { key: string; text: string }) {
+/** The main Session's rules while the foreman dispatches: it drafts a numbered instruction the person confirms, then hands it over. */
+export const INSTRUCTION_SECTION = '## Instructions\n'
+  + 'The foreman dispatches; you draft. On a new request, call orchestrator_proposal with one task per thing to do, show its tasks to the person '
+  + 'word for word, approve it with orchestrator_proposal_approve only after their yes, then hand it over with orchestrator_handoff. Do not accept '
+  + 'work yourself. When the person refines a request whose instruction is still a draft, pass that instruction\'s proposal_id to '
+  + 'orchestrator_proposal so the same number is revised in place instead of a second one being drafted. Report only as C-19 allows: the questions '
+  + 'the person must decide, the one sentence "all complete" when every task of the instruction is done, and the result of a stop the person asked '
+  + 'for. Never per-ticket results and never progress; say nothing about internal routing or waiting.'
+export function promptParts(config: PromptConfig, role: Role, environment?: string, foreman = false) {
   // A built-in part names the key its text is overridden by, which for the handoff names the role.
   const fixed = (name: string, part = name) => ({ name, kind: 'fixed' as const, key: part, text: builtIn(config, part as PartKey) })
   const team = (name: TeamSection) => ({ name, kind: 'team' as const, heading: `## ${TEAM_HEADINGS[name]}`,
@@ -107,18 +95,29 @@ export function promptParts(config: PromptConfig, role: Role, environment?: stri
   return [
     fixed('runtime/shared'), fixed(`runtime/${role}`),
     ...TEAM_SECTIONS.map(team),
-    ...['subscriptions', 'replies', role === 'orchestrator' ? 'dispatch' : 'work'].map(name => fixed(`runtime/${name}`)),
-    ...role === 'orchestrator' ? [fixed('runtime/admission')] : [],
+    ...['inputs', 'reporting', role === 'orchestrator' ? 'dispatch' : 'work'].map(name => fixed(`runtime/${name}`)),
+    ...role === 'orchestrator' && foreman ? [{ name: 'runtime/instructions', kind: 'generated' as const, key: 'runtime/instructions',
+      text: INSTRUCTION_SECTION }] : [],
     fixed('runtime/handoff', `runtime/handoff/${role}`),
     ...environment ? [{ name: 'runtime/environment', kind: 'generated' as const, key: 'runtime/environment', text: environment }] : [],
-    ...role === 'orchestrator' && policy ? [{ name: 'runtime/policy', kind: 'generated' as const, ...policy }] : [],
   ].filter(part => part.text)
 }
-export function composePrompt(config: PromptConfig, role: Role, environment?: string, policy?: { key: string; text: string }): string {
-  return promptParts(config, role, environment, policy).map(part => part.text).join('\n\n')
+export function composePrompt(config: PromptConfig, role: Role, environment?: string, foreman = false): string {
+  return promptParts(config, role, environment, foreman).map(part => part.text).join('\n\n')
+}
+/**
+ * The foreman's system prompt: its own contract, the shared rules, the team sections, the reporting chain and the execution
+ * environment. It is a separate composition rather than a third overridable role, so a team's prompt edits stay about the
+ * main and worker Sessions while the foreman keeps one fixed contract. The dispatch guidance belongs to the main Session
+ * alone: it tells a session that it does not dispatch, which is the opposite of what the foreman does (N-01, N-02).
+ */
+export function composeForemanPrompt(config: PromptConfig, environment?: string): string {
+  const team = TEAM_SECTIONS.map(name => config[name] ? `## ${TEAM_HEADINGS[name]}\n${config[name]}` : '')
+  return [foremanPrompt, builtIn(config, 'runtime/shared'), ...team, `## Reporting\n${guides.reporting}`,
+    ...environment ? [environment] : []].filter(text => text).join('\n\n')
 }
 export function composeSkill(config: PromptConfig, name: string): string {
-  return name === 'feishu' || name === 'github' ? builtIn(config, `skill/${name}`) : config.skills[name] ?? ''
+  return config.skills[name] ?? ''
 }
 
 /** An override whose built-in text changed since its `base`, with that text when kept, or whose part this version no longer has. */
@@ -138,13 +137,17 @@ export class Prompts {
     private readonly feishu: () => boolean) {
     this.versions = new Versions(store, KV.prompts.revision, KV.prompts.version)
   }
-  /** A role's prompt; the main Session's Policy section follows the settings as they are now, at each model request. */
+  /** A role's prompt, composed from the current configuration and the execution environment. */
   compose(config: PromptConfig, role: Role, variables = this.environment()): string {
-    return composePrompt(config, role, environmentSection(config, variables), role === 'orchestrator' ? policySection(this.store.settings(), config) : undefined)
+    return composePrompt(config, role, environmentSection(config, variables), role === 'orchestrator')
   }
-  /** Returns skills to register in every Session: built-in Source skills (`feishu` only when a Feishu bot is configured) followed by team skills. */
+  /** The foreman's prompt: its own contract plus the shared rules and the reporting chain (N-02). */
+  composeForeman(config: PromptConfig, variables = this.environment()): string {
+    return composeForemanPrompt(config, environmentSection(config, variables))
+  }
+  /** Returns the team's custom skills to register in every Session; the installation ships no Source skills (C-06). */
   skills(config: PromptConfig): [string, string][] {
-    return [...this.feishu() ? ['feishu'] : [], 'github', ...Object.keys(config.skills)].map(name => [name, composeSkill(config, name)])
+    return Object.keys(config.skills).map(name => [name, composeSkill(config, name)])
   }
   current(): PromptVersion {
     const revision = this.versions.revision()
@@ -194,9 +197,10 @@ export class Prompts {
   }
   preview(value: unknown) {
     const config = this.validate(value)
-    const environment = environmentSection(config, this.environment()), policy = policySection(this.store.settings(), config)
-    return { orchestrator: composePrompt(config, 'orchestrator', environment, policy), worker: composePrompt(config, 'worker', environment),
-      parts: { orchestrator: promptParts(config, 'orchestrator', environment, policy), worker: promptParts(config, 'worker', environment) },
+    const environment = environmentSection(config, this.environment())
+    // The preview shows what is actually sent, so the main Session's instruction rules are part of it (C-26b keeps the foreman on).
+    return { orchestrator: composePrompt(config, 'orchestrator', environment, true), worker: composePrompt(config, 'worker', environment),
+      parts: { orchestrator: promptParts(config, 'orchestrator', environment, true), worker: promptParts(config, 'worker', environment) },
       skills: Object.fromEntries(this.skills(config)), scope: 'Team sections, skills, and overrides of built-in parts, which follow their built-in text until overridden. Workers additionally inherit the host prompt and repository AGENTS.md. Prompt text changes what the agents are told, not what dsh-superagent allows: tool permissions, the gate and account wrappers stay.' }
   }
   save(value: unknown, baseRevision: number, source: SettingsOrigin): PromptVersion {

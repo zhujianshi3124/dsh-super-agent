@@ -5,7 +5,7 @@ import { latestAssignment, liveTicket, runningAssignment } from './model.ts'
 import type { ReportState, Ticket } from './model.ts'
 import { EnginePart, type EngineOptions } from './part.ts'
 import type { Replies } from './replies.ts'
-import { automatic, type Tickets } from './tickets.ts'
+import type { Tickets } from './tickets.ts'
 
 /** What an Assignment reports: a worker's report, or the Executor's own (`waiting` after an idle turn, `failed` after an error). */
 export interface WorkerReport {
@@ -13,12 +13,16 @@ export interface WorkerReport {
   summary: string
   /** Open question for a person: a string asks it, `null` clears an open one, and `undefined` keeps the current one. */
   question?: string | null
+  /** Which C-15 situation the question is (item number 2-7), labelled on the panel's pending list (C-37.1). */
+  questionKind?: number
   /** The person's message whose request raised the question; routes the question to the channel where it was written. */
   askedBy?: string
   /** The person's question this report answers, which the worker thereby takes up; authorizes the main Session to send an answer reply. */
   answers?: string
+  /** The Executor's own stop reason for a `failed` report: the session stopped working (N-13b), else the work failed. */
+  stopReason?: 'session-stopped' | 'failed'
 }
-const RECOVERY_NOTE = 'The host restarted during this ticket. Inspect the current worktree, git history and GitHub state before continuing. Do not repeat an already completed external operation. Finish the original assignment and report its status.'
+const RECOVERY_NOTE = 'The host restarted during this ticket. Inspect the working directory and what was already done before continuing. Do not repeat an already completed operation. Finish the original assignment and report its status.'
 
 /**
  * Assignments records what the Executor and its workers report about the Assignments that run tickets: one started, Inputs
@@ -30,12 +34,13 @@ const RECOVERY_NOTE = 'The host restarted during this ticket. Inspect the curren
 export class Assignments extends EnginePart {
   constructor(options: EngineOptions, private readonly tickets: Tickets, private readonly replies: Replies) { super(options) }
 
-  /** Marks a non-ended assignment running, queues delivery of waiting undelivered inputs on an open ticket, and emits `assignment.started`. */
-  started(ticketId: string, assignmentId: string): void {
+  /** Marks a non-ended assignment running, records the worker Session that runs it, queues delivery of waiting undelivered inputs on an open ticket, and emits `assignment.started`. */
+  started(ticketId: string, assignmentId: string, sessionId?: string): void {
     const ticket = this.require(ticketId)
     const assignment = ticket.assignments.find(item => item.id === assignmentId)
     if (!assignment || assignment.state === 'ended') return
     assignment.state = 'running'; assignment.startedAt ??= this.now()
+    if (sessionId) assignment.sessionId ??= sessionId
     ticket.updatedAt = this.now()
     this.repo.tickets.save(ticket)
     if (liveTicket(ticket) && ticket.undelivered.length) this.options.executor.deliver(ticket, assignment)
@@ -77,8 +82,8 @@ export class Assignments extends EnginePart {
   }
   /**
    * Handles a running assignment interrupted by a host restart: restarts it with a recovery note unless its latest report is
-   * `waiting`, `ready`, `blocked`, or `failed` and no input was delivered after that report, in which case it keeps its
-   * session and flushes any waiting undelivered inputs.
+   * `waiting` and no input was delivered after that report, or its worker waits at a clean node for adjudication (C-16a),
+   * in which case it keeps its session and flushes any waiting undelivered inputs.
    */
   interrupted(ticketId: string, assignmentId: string): void {
     const ticket = this.running(ticketId, assignmentId)
@@ -86,13 +91,16 @@ export class Assignments extends EnginePart {
     if (!ticket || !running) return
     const report = running.report
     const busy = !!running.deliveredAt && !!report && running.deliveredAt >= report.at
-    const settled = !!report && ['waiting', 'ready', 'blocked', 'failed'].includes(report.state) && !busy
+    const settled = (!!report && report.state === 'waiting' && !busy) || !!ticket.attention
     if (!settled) this.tickets.restart(ticket, running, 'hostRestarted', RECOVERY_NOTE)
     else if (ticket.undelivered.length) this.options.executor.deliver(ticket, running)
   }
   /**
-   * Records a worker status report on an open ticket's current assignment, updating `attention`, `answers`, held automated
-   * inputs, and ending the ticket when `dropped` or when `ready` and not waiting on followed threads (`followsDone`).
+   * Records a worker status report on an open ticket's current assignment (N-13: a ticket is working or stopped).
+   * A question stops the worker at a clean node awaiting adjudication and keeps the ticket open (C-16a). A `ready` report
+   * delivers: the ticket ends as `delivered`. A `dropped` report ends it the same way with nothing to do. A `failed` report,
+   * or a `blocked` one without a question, ends the ticket as `failed` (or `session-stopped` when the Executor says the
+   * session stopped working, N-13b); continuing the task takes a new ticket (N-13a).
    * @throws UserError for an unknown or ended ticket, an ended assignment, a question combined with a ready result or answer,
    * or a question/answer referencing a non-human or unreached trigger.
    */
@@ -112,7 +120,8 @@ export class Assignments extends EnginePart {
     if (assignment.state === 'ended') throw new UserError('assignmentEnded')
     const at = this.now()
     const previous = ticket.attention
-    const ask = (question: string) => ({ id: key('attention', ticketId, question, at), question, ...(report.askedBy ? { triggerId: report.askedBy } : {}) })
+    const ask = (question: string) => ({ id: key('attention', ticketId, question, at), question, ...(report.askedBy ? { triggerId: report.askedBy } : {}),
+      ...(report.questionKind ? { kind: report.questionKind } : {}) })
     const asked = report.question && report.question !== previous?.question ? ask(report.question) : previous
     const attention = report.question === null || report.state === 'ready' ? undefined : asked
     if (attention) ticket.attention = attention
@@ -123,13 +132,25 @@ export class Assignments extends EnginePart {
     ticket.updatedAt = at
     if (report.answers && !ticket.answers?.includes(report.answers)) ticket.answers = [...ticket.answers ?? [], report.answers]
     if (report.answers) this.takeUp(ticketId, report.answers)
-    if (report.state === 'blocked' || report.state === 'failed') ticket.undelivered = ticket.undelivered.filter(id => !automatic(ticket.inputs.find(input => input.id === id)))
     this.repo.tickets.save(ticket)
-    // A ticket that follows Threads ends with them: a ready report ends it only once followsDone holds, with that outcome.
-    const ready = !ticket.follows?.length ? 'completed' : this.tickets.followsDone(ticket)?.outcome
-    // A dropped report after a close the ticket deferred ends it as the close did, which its final notice tells.
-    const outcome = report.state === 'dropped' ? this.tickets.followsDone(ticket)?.outcome ?? 'dropped' : report.state === 'ready' ? ready : undefined
-    if (outcome) this.tickets.end(ticketId, 'executor', outcome, at)
+    // Delivery ends the ticket: a ready result, or nothing left to do (dropped). Followed threads, when they already closed,
+    // name the legacy outcome; the stop reason is `delivered` either way (N-13).
+    if (report.state === 'ready' || report.state === 'dropped') {
+      const outcome = report.state === 'dropped' ? this.tickets.followsDone(ticket)?.outcome ?? 'dropped'
+        : !ticket.follows?.length ? 'completed' : this.tickets.followsDone(ticket)?.outcome ?? 'completed'
+      this.tickets.end(ticketId, 'executor', outcome, at, undefined, 'delivered')
+      return this.require(ticketId)
+    }
+    // A worker that settled at the person's wrap-up ends its ticket as wrapped (C-17b item 3); the task goes on in a new ticket (N-13a).
+    if (report.state === 'wrapped') {
+      this.tickets.end(ticketId, 'executor', 'stopped', at, report.summary, 'wrapped')
+      return this.require(ticketId)
+    }
+    // Failure ends the ticket; a blocked report without a question is a failure too — a question would have kept it open (C-16a).
+    if (report.state === 'failed' || (report.state === 'blocked' && !attention)) {
+      this.tickets.end(ticketId, report.stopReason === 'session-stopped' ? 'system' : 'executor', 'stopped', at, report.summary,
+        report.stopReason ?? 'failed')
+    }
     return this.require(ticketId)
   }
   /** The ticket, while it is open and `assignmentId` runs it. */

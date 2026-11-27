@@ -8,8 +8,8 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterAll, beforeAll, expect, it, vi } from 'vitest'
 import type { UserMessage } from '@deepseek-ai/dsh-llm'
-import { latestAssignment } from '../src/core/index.ts'
 import { promptParts } from '../src/app/prompts.ts'
+import { Proposals } from '../src/app/proposals.ts'
 import { RESOURCES } from '../src/app/resources.ts'
 import { TICKET_STATES } from '../src/app/cards.ts'
 import { Runtime } from '../src/app/runtime.ts'
@@ -36,8 +36,10 @@ interface Skill { name: string; description: string; content: string }
 /**
  * Maximum combined character count of system prompt and tool definitions per role (~5% above baseline).
  * Lower this limit when shrinking model-facing text; raise it only intentionally and explain why in the commit message.
+ * Raised 59_000 -> 59_600 on 2026-11-18 for the three instruction tools (draft, approve, hand over) that SPEC-foreman §10 step
+ * one adds to the main Session; their descriptions were trimmed first, and the ceiling still leaves about 160 characters spare.
  */
-const BUDGET: Record<Role, number> = { orchestrator: 59_000, worker: 40_500 }
+const BUDGET: Record<Role, number> = { orchestrator: 59_600, worker: 40_500 }
 const PROMPTS = 'prompts/, skills/', TOOLS = 'src/app/tools/', SESSIONS = 'src/app/sessions.ts'
 const NOTICES = 'src/app/notices.ts', LINKS = 'src/app/links.ts', ASSESSMENT = 'src/app/assessment.ts'
 const EXECUTOR = 'src/executor/dsh.ts', ERRORS = 'src/core/errors.ts'
@@ -100,7 +102,8 @@ async function start() {
   const sections = new Map<string, Section>()
   const skills = new Map<string, Skill[]>()
   const inputs: { sessionId: string; text: string }[] = []
-  const create = async ({ sessionId }: { sessionId: string }) => {
+  let created = 0
+  const create = async ({ sessionId, workspaceId }: { sessionId: string; workspaceId: string }) => {
     if (agents.has(sessionId)) return
     const agentCtx = new Context()
     const own = new Map<string, Tool>(), registered: Skill[] = []
@@ -123,17 +126,21 @@ async function start() {
     const deliver = (queue: UserMessage[]) => (message: UserMessage) => {
       queue.push(message); record(message); agents.get(sessionId)!.status = 'running'
     }
-    const session = { id: sessionId, snapshotEvents: () => [], requestHeader: () => undefined, append: () => {} }
+    const session = { id: sessionId, header: { cwd: workspaceId, createdAt: ++created, parentSession: undefined },
+      snapshotEvents: () => [], requestHeader: () => undefined, append: () => {} }
     agents.set(sessionId, { id: sessionId, ctx: agentCtx, inbox, followup: deliver(inbox.nextTurn), steer: deliver(inbox.nextStep),
       inject: record, status: 'idle', cancel: () => {}, whenIdle: async () => {}, session } as never)
   }
   const resolveAgent = async (id: string) => agents.has(id) ? { agent: agents.get(id) } : { error: { code: 'session/not-found' } }
   const ctx = new Context()
   const history = { read: async () => ({ events: [] }), [Symbol.asyncDispose]: async () => {} }
+  const sessionList = { list: () => [...agents.values()].map(agent => ({ id: (agent as unknown as { id: string }).id,
+    header: (agent as unknown as { session: { header: { cwd: string; createdAt: number; parentSession?: string } } }).session.header })) }
   const services = { agents, llm: { resolveCallConfig: async (value: unknown) => value },
     workspaceRegistry: { create: async (cwd: string) => ({ id: cwd }) },
-    sessionController: { create, resolveAgent, selectModel: async () => {}, rename: async () => {}, inspect: async () => ({ events: [] }) },
+    sessionController: { create, resolveAgent, selectModel: async () => {}, rename: async () => {}, modelCatalog: async () => ({ groups: [] }), inspect: async () => ({ events: [] }) },
     sessionPersistence: { flush: async () => {}, open: async () => history }, permissionPresets: { set: () => {} }, subprocess,
+    sessions: sessionList,
     webServer: { host: '127.0.0.1', port: 3082, register: () => () => {} } }
   for (const [name, service] of Object.entries(services)) ctx.reflect.provide(name, service)
   const seed = new Store(join(directory, 'orchestrator.sqlite'))
@@ -142,6 +149,8 @@ async function start() {
   seed.close()
   const runtime = new Runtime(ctx, testMachine({ stateDir: directory }), () => {})
   await runtime.ready
+  // The main Session is the person to open: the fixture opens one in the main workspace, as DSH's sidebar does.
+  await runtime.sessions.ensure(runtime.masterId, runtime.masterWorkspace, 'dsh-superagent orchestrator', 'orchestrator')
   runtime.sources.register(feishuKind); runtime.sources.register(githubKind)
   const settings = runtime.store.settings()
   const allowed = { feishu: { allowed: [{ id: MEMBER, name: 'Alice' }], syncChat: CHAT }, github: { allowed: [{ id: 'alice' }] } }
@@ -159,60 +168,69 @@ type Host = Awaited<ReturnType<typeof start>>
 async function drive(host: Host) {
   const { runtime, run } = host
   const master = runtime.masterId
-  // Candidates wait, which the main Session decides in one call: a request it accepts, thanks it ignores, and plain chat in the
+  // The foreman plans and dispatches; the main Session only drafts, confirms and hands over (N-01/N-02, C-22).
+  const foreman = runtime.rotation.foremanSession()
+  expect(host.tools.get(foreman)?.has('orchestrator_route')).toBe(true)
+  // Candidates wait, which the foreman decides in one call: a request it accepts, thanks it ignores, and plain chat in the
   // channel, a proactive candidate whose card shows it touches no rule, which it ignores from its card.
   const request = feishu('1', '@bot 修一下回归'), thanks = feishu('3', '@bot 谢谢'), chat = feishu('4', '中午吃什么', { mentions: [] })
   await runtime.receive(request); await runtime.receive(thanks); await runtime.receive(chat)
-  const routed = await run(master, 'orchestrator_route', { decisions: [
-    { kind: 'accept', trigger_id: request.id, title: '修复回归', worktree_name: 'fix-regression', acknowledgement: '收到，修复回归。' },
+  // A confirmed instruction for the request, drafted and approved in the store as the main Session's tools would.
+  const proposals = new Proposals(runtime.store)
+  const instruction = proposals.draft({ tasks: [{ title: '修复回归', request: '@bot 修一下回归', accept: '回归通过' }],
+    heard: '@bot 修一下回归', origin: { source: 'chief', thread: master, messageId: 'message-1' } })
+  proposals.approve(instruction.id)
+  proposals.markHandedOff(instruction.id)
+  const routed = await run(foreman, 'orchestrator_route', { decisions: [
+    { kind: 'accept', trigger_id: request.id, proposal: instruction.id, task: 1, title: '修复回归', worktree_name: 'fix-regression', acknowledgement: '收到，修复回归。' },
     { kind: 'ignore', trigger_id: thanks.id, reason: 'Thanks only.' }, { kind: 'ignore', trigger_id: chat.id, reason: 'Lunch chat.' }] }) as
     { results: { decision?: string; reason?: string; ticket?: { ticket_id: string } }[] }
   expect(routed.results.map(result => result.decision)).toEqual(['accept', 'ignore', 'ignore'])
   expect(routed.results[2]!.reason).toMatch(/^Ignored from its card/)
   const a = routed.results[0]!.ticket!.ticket_id
-  const answer = { trigger_id: request.id, purpose: 'answer', text: '是配置。' }
-  const refusal = await run(master, 'orchestrator_reply', answer).then(() => '', (error: Error) => error.message)
-  const proposal = feishu('5', '把副标题改成“浏览网页”', { mentions: [] })
-  await runtime.receive(proposal)
+  // A stop of an unknown ticket is refused with a UserError, whose text is model-facing too.
+  const refusal = await run(master, 'orchestrator_ticket_stop', { ticket_id: 'no-such-ticket' }).then(() => '', (error: Error) => error.message)
+  const copy = feishu('5', '@bot 把副标题改成“浏览网页”')
+  await runtime.receive(copy)
   vi.spyOn(Commands.prototype, 'lark').mockResolvedValue({ items: [{ message_id: 'om_5', chat_id: CHAT }] })
-  await run(master, 'orchestrator_eval', { trigger_id: proposal.id })
-  const proactive = (await run(master, 'orchestrator_eval_decide', { trigger_id: proposal.id, decision: 'accept', title: '文案修订', worktree_name: 'copy-fix',
-    scope: '改副标题', reason: 'explicit copy change', intent_evidence: 'quoted', acknowledgement: '收到，把副标题改成“浏览网页”。',
-    rule_assessments: [{ rule_id: 'copy', matched: true, reason: 'copy change' }, { rule_id: 'visual', matched: false, reason: 'not visual' }],
-    direction: { implementation_requested: true, target_basis: 'specified', requires_design_decision: false, evidence: 'it names the text' } })).ticket as { ticket_id: string }
-  const b = proactive.ticket_id
+  // A second acceptance names its own confirmed instruction and task, as any acceptance does (C-22).
+  const second = proposals.draft({ tasks: [{ title: '文案修订', request: '@bot 把副标题改成“浏览网页”', accept: '副标题已改' }],
+    heard: '@bot 把副标题改成“浏览网页”', origin: { source: 'chief', thread: master, messageId: 'message-2' } })
+  proposals.approve(second.id)
+  proposals.markHandedOff(second.id)
+  const accepted = await run(foreman, 'orchestrator_route', { decisions: [
+    { kind: 'accept', trigger_id: copy.id, proposal: second.id, task: 1, title: '文案修订', worktree_name: 'copy-fix', acknowledgement: '收到，把副标题改成“浏览网页”。' }] }) as
+    { results: { ticket?: { ticket_id: string } }[] }
+  const b = accepted.results[0]!.ticket!.ticket_id
   await runtime.idle()
   const [workerA, workerB] = [a, b].map(workerSessionId) as [string, string]
   await run(workerA, 'orchestrator_report', { state: 'progress', summary: 'Needs a decision.', human_action: 'Desktop too?' })
-  await run(workerA, 'orchestrator_report', { state: 'progress', summary: 'It reads the config.', human_action: null, reply_to_trigger_id: request.id })
+  await run(workerA, 'orchestrator_report', { state: 'progress', summary: 'It reads the config.', human_action: null })
   const other = feishu('9', '@bot 顺便看看这个')
   await runtime.receive(other)
-  await run(master, 'orchestrator_route', { decisions: [{ kind: 'attach', ticket_id: a, trigger_id: other.id }] })
-  await run(workerA, 'orchestrator_thread_unrelated', { thread: `feishu:${CHAT}:om_9`, reason: 'It asks for something else.' })
-  await run(workerA, 'orchestrator_thread_follow', { thread: `feishu:${CHAT}:om_7`, reason: 'The same settings page.' })
+  await run(foreman, 'orchestrator_route', { decisions: [{ kind: 'attach', ticket_id: a, trigger_id: other.id }] })
   await runtime.receive(feishu('7', '@bot 这个页面的按钮也改一下'))
   const beyond = feishu('8', '另外把导出也做了', { mentions: [], root_id: 'om_1' })
   await runtime.receive(beyond)
   await runtime.idle()
   await run(workerA, 'orchestrator_trigger_handback', { trigger_id: beyond.id, reason: 'It asks for an export feature.' })
-  await run(master, 'orchestrator_ticket_note', { ticket_id: a, text: 'Ticket B changes the same settings page.' })
   await runtime.pump()
   await runtime.idle()
   await run(workerA, 'orchestrator_report', { state: 'ready', summary: 'Done.' })
   await runtime.receive(feishu('2', '再加一个按钮', { mentions: [], root_id: 'om_1' }))
-  await vi.waitFor(async () => {
-    await runtime.pump()
-    expect(runtime.store.tickets.get(a)!.inputs.some(input => input.kind === 'resumed')).toBe(true)
-  })
+  await runtime.pump()
+  await runtime.idle()
+  expect(runtime.store.tickets.get(a)!.ended).toBeDefined()
+  expect(runtime.store.tickets.get(a)!.inputs.some(input => input.kind === 'resumed')).toBe(false)
   const policy = runtime.store.settings().policy
   // The rule ticket b was accepted under changes, so its worker is told how; the one it was not is disabled, which tells no one.
   const rules = policy.rules.map(rule => rule.id === 'visual' ? { ...rule, enabled: false }
     : rule.id === 'copy' ? { ...rule, instruction: `${rule.instruction} Keep the wording short.` } : rule)
   await runtime.settings.save('policy', { ...policy, rules }, runtime.store.blockRevision('policy'), 'panel')
-  // Worker b's turn ends: it is idle, as DSH says when it emits the event.
+  // Worker b's turn ends: it is idle, as DSH says when it emits the event. Its last report was progress, so the host asks for status.
   host.agents.get(workerB)!.status = 'idle'
   host.ctx.emit('agent/status', { agent: host.agents.get(workerB), status: 'idle' } as never)
-  await vi.waitFor(() => expect(latestAssignment(runtime.store.tickets.get(b)!)?.report?.state).toBe('waiting'))
+  await runtime.idle()
   runtime.engine.requestStatus(b)
   // Resume runs once the status request reached the worker (whose Assignment is then busy rather than settled), so it gets the recovery note.
   await runtime.idle()
@@ -257,14 +275,20 @@ function collect(host: Host, { a, b, workerA, workerB, refusal }: Awaited<Return
       surfaces.push({ where: `${role} tool ${tool.name}`, owner: TOOLS, role, text: descriptions.join('\n') })
     }
   }
+  // The foreman holds the routing tools the main Session no longer has (N-01/N-02); its wording counts against the same budget.
+  for (const tool of host.tools.get(runtime.rotation.foremanSession())!.values()) {
+    const descriptions = [tool.description]
+    walk(tool.parameters, node => { if (typeof node.description === 'string') descriptions.push(node.description) })
+    surfaces.push({ where: `foreman tool ${tool.name}`, owner: TOOLS, role: 'orchestrator', text: descriptions.join('\n') })
+  }
   for (const { name, description, content } of host.skills.get(runtime.masterId)!) {
     surfaces.push({ where: `skill ${name}`, owner: PROMPTS, role: 'both', text: `${description}\n${content}` })
   }
-  surfaces.push({ where: 'orchestrator tool orchestrator_reply error', owner: ERRORS, role: 'orchestrator', text: refusal })
+  surfaces.push({ where: 'orchestrator tool orchestrator_ticket_stop error', owner: ERRORS, role: 'orchestrator', text: refusal })
   for (const { text } of host.inputs.filter(input => input.sessionId === runtime.masterId)) {
     const value = JSON.parse(text) as Record<string, unknown>
     const kind = String(value.kind ?? Object.keys(value)[0])
-    const owner = kind === 'candidate' ? LINKS : kind === 'worker_attention' ? TOOLS : kind === 'worker_report' ? EXECUTOR : NOTICES
+    const owner = kind === 'candidate' ? LINKS : NOTICES
     surfaces.push({ where: `orchestrator input ${kind}`, owner, role: 'orchestrator', text })
   }
   for (const [id, sessionId] of [[a, workerA], [b, workerB]] as const) {
@@ -296,18 +320,20 @@ beforeAll(async () => {
 })
 afterAll(async () => { await host?.stop() })
 const toolsOf = (role: Role) => host.tools.get(role === 'orchestrator' ? host.runtime.masterId : sessions.workerA)!
+/** The foreman holds the routing tools the main Session handed over (N-01/N-02). */
+const foremanTools = () => host.tools.get(host.runtime.rotation.foremanSession())!
 
 /** Check collected surfaces for unregistered tools, invalid enum options, legacy terms, banned phrases, and cross-role tool references. */
 function failures(): Map<string, string> {
   const found = new Map<string, string>()
   const options = new Map<string, Set<string>>()
-  const schemas = [...toolsOf('orchestrator').values(), ...toolsOf('worker').values()].map(tool => tool.parameters)
+  const schemas = [...toolsOf('orchestrator').values(), ...foremanTools().values(), ...toolsOf('worker').values()].map(tool => tool.parameters)
   walk(schemas, (node, property) => {
     if (property && Array.isArray(node.enum)) options.set(property, new Set([...options.get(property) ?? [], ...node.enum.map(String)]))
   })
-  for (const name of ['decision', 'purpose', 'state']) expect(options.has(name), `${name} has options`).toBe(true)
-  const tools = { orchestrator: new Set(toolsOf('orchestrator').keys()), worker: new Set(toolsOf('worker').keys()) }
-  const registered = (token: string) => tools.orchestrator.has(token) || tools.worker.has(token)
+  for (const name of ['kind', 'state']) expect(options.has(name), `${name} has options`).toBe(true)
+  const tools = { orchestrator: new Set(toolsOf('orchestrator').keys()), foreman: new Set(foremanTools().keys()), worker: new Set(toolsOf('worker').keys()) }
+  const registered = (token: string) => tools.orchestrator.has(token) || tools.foreman.has(token) || tools.worker.has(token)
   const variables = new Set(host.runtime.ticketEnvironment(host.runtime.store.tickets.get(sessions.a)!).map(variable => variable.key))
   for (const { where, owner, role, text } of surfaces) {
     const fail = (problem: string) => found.set(`${where}: ${problem}`, owner)
@@ -332,6 +358,8 @@ function failures(): Map<string, string> {
     }
     // Text only one role reads names the other role's tools only in a sentence that says the other role uses them.
     const other = role === 'orchestrator' ? 'worker' : role === 'worker' ? 'orchestrator' : undefined
+    // The main Session and the foreman are one side of the split: the routing tools the foreman holds are still its side's.
+    const own = role === 'orchestrator' ? new Set([...tools.orchestrator, ...tools.foreman]) : tools.worker
     const names = other === 'worker' ? /\b(workers?|executors?)\b/i : /\b(orchestrator|main session)\b/i
     for (const sentence of sentences(text)) {
       for (const [, count] of sentence.matchAll(/\b(\d+)[- ]words?\b/g)) {
@@ -339,7 +367,7 @@ function failures(): Map<string, string> {
         if (Number(count) !== limit) fail(`"${count} words" is not ${limit}`)
       }
       for (const [token] of other && !names.test(sentence) ? sentence.matchAll(/\borchestrator_[a-z_]+/g) : []) {
-        if (!registered(token) || tools[role as Role].has(token)) continue
+        if (!registered(token) || own.has(token)) continue
         fail(`tells the ${role} to use ${token}, which only the ${other} has`)
       }
     }
@@ -348,21 +376,29 @@ function failures(): Map<string, string> {
 }
 
 it('collects both roles\' tools, prompts, skills and inputs', () => {
-  expect([...toolsOf('worker').keys()].sort()).toEqual(['orchestrator_ack', 'orchestrator_read', 'orchestrator_report',
-    'orchestrator_thread_follow',
-    'orchestrator_thread_unrelated', 'orchestrator_trigger_handback'])
-  expect([...toolsOf('orchestrator').keys()]).toEqual(expect.arrayContaining(['orchestrator_route', 'orchestrator_eval_decide', 'orchestrator_reply']))
-  // The one routing tool takes the place of four.
-  for (const name of ['orchestrator_ticket_accept', 'orchestrator_ticket_attach', 'orchestrator_ticket_stop', 'orchestrator_trigger_ignore']) {
+  expect([...toolsOf('worker').keys()].sort()).toEqual(['orchestrator_read', 'orchestrator_report', 'orchestrator_trigger_handback'])
+  // The main Session drafts, confirms, hands over, adjudicates and stops; it holds no routing (N-01, S-7).
+  expect([...toolsOf('orchestrator').keys()]).toEqual(expect.arrayContaining(['orchestrator_proposal', 'orchestrator_proposal_approve',
+    'orchestrator_handoff', 'orchestrator_ticket_stop', 'orchestrator_adjudicate', 'orchestrator_foreman_replace']))
+  expect(toolsOf('orchestrator').has('orchestrator_route')).toBe(false)
+  // The foreman routes, resumes adjudicated tickets and records its decisions, and never confirms an instruction itself (N-02, S-7).
+  expect([...foremanTools().keys()]).toEqual(expect.arrayContaining(['orchestrator_route', 'orchestrator_ticket_resume',
+    'orchestrator_ticket_stop_stuck', 'orchestrator_ticket_decision', 'orchestrator_say']))
+  expect(foremanTools().has('orchestrator_proposal_approve')).toBe(false)
+  // The one routing tool takes the place of four; the removed assessment and reply tools are gone from every role.
+  for (const name of ['orchestrator_ticket_accept', 'orchestrator_ticket_attach', 'orchestrator_trigger_ignore',
+    'orchestrator_eval', 'orchestrator_eval_decide', 'orchestrator_reply', 'orchestrator_ack', 'orchestrator_ticket_retry']) {
     expect(toolsOf('orchestrator').has(name)).toBe(false)
+    expect(foremanTools().has(name)).toBe(false)
+    expect(toolsOf('worker').has(name)).toBe(false)
   }
   const wheres = new Set(surfaces.map(surface => surface.where))
-  for (const where of ['orchestrator prompt runtime/dispatch', 'worker prompt runtime/work', 'skill dsh-superagent-github', 'skill dsh-superagent-feishu',
-    'orchestrator prompt runtime/admission', 'orchestrator input candidate', 'orchestrator input worker_attention', 'orchestrator input worker_report',
-    'orchestrator input thread_unrelated', 'orchestrator input ticket_ended', 'orchestrator input settings_saved', 'worker input assignment (explicit)',
-    'worker input assignment (inferred)', 'worker input policy-changed', 'worker input resumed', 'worker input status',
-    'worker input recovery', 'worker input note', 'worker input trigger (context)', 'orchestrator input follow_up',
-    'orchestrator input thread_followed', 'orchestrator tool orchestrator_reply error']) expect(wheres).toContain(where)
+  for (const where of ['orchestrator prompt runtime/dispatch', 'worker prompt runtime/work',
+    'orchestrator input candidate',
+    'orchestrator input ticket_ended', 'orchestrator input settings_saved', 'worker input assignment (explicit)',
+    'worker input status',
+    'worker input recovery', 'orchestrator input follow_up',
+    'orchestrator tool orchestrator_ticket_stop error']) expect(wheres).toContain(where)
   expect(sessions.refusal).not.toBe('')
 })
 
@@ -378,36 +414,35 @@ it('enforces the word limits the text states', async () => {
   expect(checkedImText(words(IM_WORDS))).toBe(words(IM_WORDS))
   expect(() => checkedImText(words(IM_WORDS + 1))).toThrow(`maximum is ${IM_WORDS}`)
   const attach = (note: string) =>
-    host.run(host.runtime.masterId, 'orchestrator_route', { decisions: [{ kind: 'attach', ticket_id: 'unknown', trigger_id: 'unknown', note }] })
+    host.run(host.runtime.rotation.foremanSession(), 'orchestrator_route', { decisions: [{ kind: 'attach', ticket_id: 'unknown', trigger_id: 'unknown', note }] })
   // A note over the limit refuses its item alone; one at the limit goes on to the Engine, which knows no such ticket.
   expect(await attach(words(NOTE_WORDS + 1))).toEqual({ results: [expect.objectContaining({ refused: expect.stringContaining(`${NOTE_WORDS} words`) })] })
   expect(await attach(words(NOTE_WORDS))).toEqual({ results: [expect.objectContaining({ refused: expect.stringMatching(/Unknown (ticket|trigger)/) })] })
 })
 
-/** The enabled rules' lines of the main Session's Policy section, as the settings hold them now. */
-const ruleLines = () => host.runtime.store.settings().policy.rules.filter(rule => rule.enabled).map(rule => `- ${rule.name} (${rule.id}): ${rule.instruction}`)
 it.each(['orchestrator', 'worker'] as const)('keeps the %s within its character budget', role => {
   const ids = role === 'orchestrator' ? [host.runtime.masterId] : [sessions.workerA, sessions.workerB]
-  // Strip machine-dependent variable values (such as directory paths), and the team's rules, before measuring prompt length.
-  const builtIn = (text: string) => ruleLines().reduce((rest, line) => rest.replace(line, ''), text).replace(/ = "[^"\n]*"/g, ' = ""')
+  // Strip machine-dependent variable values (such as directory paths) before measuring prompt length.
+  const builtIn = (text: string) => text.replace(/ = "[^"\n]*"/g, ' = ""')
   const prompt = Math.max(...ids.map(id => builtIn(host.sections.get(id)!({})).length))
   const definitions = [...toolsOf(role).values()].map(({ name, description, parameters }) => ({ name, description, parameters }))
   const tools = JSON.stringify(definitions).length
   expect(prompt + tools, `${prompt} characters of prompt and ${tools} of tools`).toBeLessThanOrEqual(BUDGET[role])
 })
 
-it('keeps the routing rules in dispatch, which says the main Session may accept the rest of a stop message as new work', () => {
-  const route = toolsOf('orchestrator').get('orchestrator_route')!.description
+it('keeps the routing rules with the foreman, and leaves the main Session drafting', () => {
+  const route = foremanTools().get('orchestrator_route')!.description
   const dispatch = surfaces.find(surface => surface.where === 'orchestrator prompt runtime/dispatch')!.text
-  expect(dispatch).toContain('you may accept the rest of the message as new work')
-  expect(dispatch).toContain('decide those whose card already settles them in one orchestrator_route call')
+  // The main Session drafts and hands over; it never routes (N-01, S-7).
+  expect(dispatch).toContain('You do not route candidates')
+  expect(dispatch).toContain('orchestrator_proposal')
+  expect(dispatch).not.toMatch(/Route them with orchestrator_route/)
+  // The foreman creates each ticket under a confirmed instruction, and its words reach the person through the main Session (C-16a, C-22).
+  const foreman = host.runtime.prompts.composeForeman(host.runtime.prompts.current().config)
+  expect(foreman).toContain('Create each ticket with orchestrator_route')
+  expect(foreman).not.toContain('You do not route candidates')
+  expect(foreman).toContain('orchestrator_say')
+  expect(dispatch).toContain('orchestrator_ticket_stop')
+  expect(route).toContain('confirmed instruction')
   expect(route).not.toMatch(/needs a new ticket on another explicit instruction/)
-})
-
-it('lists in the main Session\'s Policy section exactly the enabled rules, as the drive\'s save left them', () => {
-  const text = host.sections.get(host.runtime.masterId)!({}), at = text.indexOf('## Policy')
-  const listed = text.slice(at, text.indexOf('\n\n', at)).split('\n').filter(line => line.startsWith('- '))
-  expect(listed).toEqual(ruleLines())
-  // The drive disabled the visual rule and changed the copy rule's instruction.
-  expect(listed).toEqual([expect.stringMatching(/^- .* \(copy\): .*Keep the wording short\.$/)])
 })

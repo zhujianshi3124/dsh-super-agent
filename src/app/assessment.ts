@@ -29,6 +29,8 @@ export const AssessmentSchema = z.object({
   scope: z.string().max(1500),
   intent_evidence: z.string().trim().min(1).max(700).nullish().describe('For acceptance: the quotes that establish the three facts.'),
   acknowledgement: AcknowledgementSchema.nullish().describe('For acceptance: one sentence in the source language, posted as a reply to the trigger; omit only when a matched rule asks for silence.'),
+  proposal: z.string().min(1).nullish().describe('For acceptance: the confirmed instruction this ticket carries, such as pr-1. No ticket exists without one (C-22).'),
+  task: z.number().int().min(1).nullish().describe('For acceptance: the number of the task within that instruction, counting from 1.'),
   reason: z.string().min(1).max(500),
 }).strict().refine(value => value.decision !== 'accept' || !directionAllowed(value.direction) || !value.rule_assessments.some(rule => rule.matched)
   || !!value.worktree_name, { message: 'Accepted work requires a short English worktree_name', path: ['worktree_name'] })
@@ -36,7 +38,8 @@ export const AssessmentSchema = z.object({
 /** Character limits in the initial thread window: for the trigger itself, its two nearest neighbours, other window messages, and stub previews. */
 const TRIGGER_CHARS = 4000, NEAR_CHARS = 1200, WINDOW_CHARS = 400, STUB_CHARS = 50
 const FINISHED = 'This assessment has finished: it was decided, timed out or restarted'
-const EXPLICIT = 'This is an explicit request, which is routed instead of assessed: use orchestrator_route with its trigger_id and kind accept, attach, stop or ignore'
+const EXPLICIT = 'This is an explicit request, which is not assessed: draft a numbered instruction from it with orchestrator_proposal '
+  + 'and hand it over once the person confirms it (C-06, C-22)'
 type AssessmentContext = Awaited<ReturnType<typeof admissionContext>>
 type ReadCache = {
   snapshots: Map<string, string>; images: Map<string, { id: string; text: string }>; messages: Map<string, string>; cursors: Set<string>
@@ -61,6 +64,8 @@ export interface AssessorHost {
   /** Delivers a candidate card to the main Session once per request ID, resolving after the Session receives it. */
   deliver(requestId: string, text: string): Promise<void>
   candidateCard(candidate: Candidate): Promise<Record<string, unknown>>
+  /** Whether an instruction already carries this trigger's message, so another card would ask the person the same thing twice. */
+  claimed(trigger: Trigger): boolean
 }
 
 /** Schema for bounded context or repository read requests during an active evaluation (`orchestrator_eval_read`). */
@@ -96,6 +101,10 @@ export class MasterAssessor implements Assessor {
     host.effects.handle('assessment', async ({ triggerId }, evalId) => {
       const candidate = this.host.engine.candidate(triggerId)
       if (candidate?.evalId !== evalId) return
+      // An Eval that outlives its deadline is re-run, and its card would come again for a request the person already had turned
+      // into an instruction: mark it delivered so the main Session is not asked to confirm the same words a second time.
+      const primary = candidate.triggers.at(-1)
+      if (primary && this.host.claimed(primary)) { this.host.engine.candidateDelivered(evalId); return }
       await this.host.deliver(`candidate:${evalId}`, JSON.stringify({ kind: 'candidate', ...await this.host.candidateCard(candidate) }))
       this.host.engine.candidateDelivered(evalId)
     }, { limit: () => host.paused() ? 0 : 4 })

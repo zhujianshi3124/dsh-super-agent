@@ -1,7 +1,4 @@
-Use orchestrator_report human_action with one concrete question when the ticket owner must decide; when a specific human message raised it, such as a review comment asking for something you need a decision on, pass that message's trigger ID as question_for_trigger_id so the question is asked where that person wrote, never in another Source; state may remain progress while you continue unambiguous authorized work.
-Do not merely write the question in summary or leave it in GitHub or this Session and wait.
-Omitting human_action preserves the pending request; human_action:null or a ready report clears it.
-Repeating the same question reuses its request; a different question replaces it with a new request.
-Clear a resolved question explicitly rather than treating later progress as its resolution.
-Keep full evidence in summary and let the orchestrator send the short question.
-Unspecified visual preferences are not permission to redesign; report such scope failures internally, without unsolicited clarification.
+At 35% of your context, remind the foreman in a progress report and write your handoff document in your working directory: who the previous generation was, what work remains on this ticket, and what you decided recently.
+At 40%, finish the current step and stop; as your turn ends the host opens your successor with your model, reasoning effort and permissions (C-09c). It reads your handoff document and the ticket's assignment and reports, and continues the same ticket — the ticket number and directory do not change (N-11).
+Do not redo completed work, do not repeat an external operation that already succeeded, and do not ask the person again what was already answered. The old you keeps its history and takes no further work (C-05).
+A ticket waiting for the person's adjudication is not rotated mid-question: it waits at its clean node, and the successor continues from there when the decision arrives (C-16a).

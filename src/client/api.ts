@@ -1,4 +1,4 @@
-/** Same-origin client and polling hook for the orchestrator management API. */
+/** Same-origin client and polling hook for the orchestrator management API (C-38 is the exhaustive action table). */
 import { useCallback, useEffect, useRef, useState } from 'react'
 import type { Api, ApiRequest, ApiResponse } from '../app/api.ts'
 import { USER_ERRORS, type UserErrorCode } from '../core/errors.ts'
@@ -97,11 +97,6 @@ export function usePoll<T>(load: () => Promise<T>, deps: readonly unknown[], int
   return { data: state.data, error: state.error, reload }
 }
 
-export const DECISION_FILTERS = ['work', 'stop', 'ignore', 'unavailable', 'all'] as const
-export type DecisionFilter = typeof DECISION_FILTERS[number]
-export const DECISION_KINDS: Readonly<Record<DecisionFilter, string>> = { work: 'accept,reopen', stop: 'stop', ignore: 'ignore',
-  unavailable: 'unavailable', all: '' }
-
 export type Call = <K extends keyof Api>(route: K, ...request: {} extends ApiRequest<K> ? [request?: ApiRequest<K>] : [request: ApiRequest<K>])
   => Promise<ApiResponse<K>>
 /** Build a typed route caller that resolves localized error messages on each request. */
@@ -118,23 +113,20 @@ export function caller(messages: () => ApiMessages): Call {
 
 export type StateView = ApiResponse<'GET state'>
 export type SetupView = StateView['setup']
+export type HealthEntry = StateView['health'][string]
+export type OverviewView = ApiResponse<'GET overview'>
 export type SettingsView = ApiResponse<'GET settings'>
 export type Settings = { [B in keyof SettingsView['blocks']]: SettingsView['blocks'][B]['value'] }
-export type SourceView = SettingsView['sources'][number]
-export type SourceStatusRow = ApiResponse<'GET sources'>[number]
 export type TicketRow = ApiResponse<'GET tickets'>['items'][number]
 export type TicketPageView = ApiResponse<'GET tickets/:id'>
-export type ThreadRow = ApiResponse<'GET threads'>['items'][number]
-export type ThreadPageView = ApiResponse<'GET threads/:key'>
-export type TriggerRow = ThreadPageView['timeline'][number]
-export type DecisionRow = ApiResponse<'GET decisions'>['items'][number]
-export type Problem = ApiResponse<'GET overview'>['problems'][number]
-export type DroppedReply = SourceStatusRow['dropped'][number]
+export type ProposalPageView = ApiResponse<'GET proposals/:id'>
+export type Problem = OverviewView['problems'][number]
 export type SearchView = ApiResponse<'GET search'>
 export type TicketSummary = SearchView['tickets'][number]
+export type SearchItem = SearchView['items'][number]
 export type { TicketStage }
-export type HistoryView = ApiResponse<'GET policy/history'>
+export type HistoryView = ApiResponse<'GET settings/history'>
 export type PromptsView = ApiResponse<'GET prompts'>
 export type PromptConfig = PromptsView['defaults']
 export type ThreadFacts = TicketRow['threads'][number]
-export type Actor = TriggerRow['actor']
+export type Actor = SearchItem['actor']

@@ -1,159 +1,112 @@
 // @vitest-environment jsdom
-// The overview.
+// The overview (C-37): pending adjudications, system problems, executor load, instructions, main Session, foreman.
 import { expect, it } from 'vitest'
 import { en, zh } from '../src/client/locales.ts'
-import { usePanel, mount, remount, all, find, tab, click, text } from './fixtures/panel.tsx'
-import { server, droppedReply, threadSummary } from './fixtures/panel-server.ts'
+import { usePanel, mount, remount, all, click, text } from './fixtures/panel.tsx'
+import { server, ticketSummary } from './fixtures/panel-server.ts'
 
 usePanel()
-it('leads the overview with the pending Tickets, then problems, the last day and the Executor, each linking to its stage', async () => {
+const quiet = () => {
+  server.person = []; server.proposals = []; server.load = { running: 0, queued: 0 }
+  server.master = { id: '', generation: 0, usage: null }
+  server.foreman = { session: '', generation: 0, pending: false, usage: null, rotatedAt: null, open: true }
+}
+
+it('leads the overview with the tickets awaiting adjudication, each labelled by its C-15 kind', async () => {
+  server.person = [ticketSummary({ attention: { id: 'q1', kind: 5, question: '要删除这个文件吗' },
+    note: { text: '要删除这个文件吗', error: false } }, { stage: 'adjudication' }),
+  ticketSummary({ id: 't2', title: '改文案', attention: { id: 'q2', kind: 3, question: '完成标准要变' },
+    note: { text: '完成标准要变', error: false } }, { stage: 'adjudication' })]
   await mount()
-  expect(tab(zh['tab.overview']).getAttribute('aria-selected')).toBe('true')
-  expect(all('[role="tab"]').map(tab => tab.textContent)).toEqual(['概览', '来源', '触发', '评估', '执行', '设置'])
-  expect(all('.dt-section-title').map(title => title.textContent)).toEqual(['待处理工单2', '系统问题2', '过去 24 小时详情 ›', '执行器详情 ›'])
-  expect(all('.dt-cards .dt-ticket-stage').map(item => item.textContent)).toEqual(['待回答', '待处理失败'])
-  expect(all('.dt-cards .dt-att-what').map(item => item.textContent)).toEqual(['飞书 来源异常', '评估未完成：这个文案好奇怪'])
-  // Actions sit below the title and Threads, apart from the stage, each with its icon.
-  expect(all('.dt-ticket').every(row => row.querySelector('.dt-ticket-stage button, .dt-ticket-stage a') === null
-    && [...row.querySelectorAll('.dt-ticket-actions button, .dt-ticket-actions a')].every(action => action.querySelector('svg')))).toBe(true)
-  expect(text()).toContain('来源会在每次轮询时自动重试')
-  expect(text()).toContain('需要确认按钮颜色')
-  expect(all('.dt-stat').map(stat => stat.textContent)).toEqual(['到达12', '被过滤2', '已评估5', '接单或续做1', '执行中2 / 3', '排队0', '等待新触发1'])
-  expect(all('.dt-chip').map(chip => chip.textContent)[0]).toBe('GitHub#42CI 失败1')
-  expect(document.querySelector('.dt-chip-problem')?.textContent).toBe('CI 失败1')
-  expect(document.querySelector<HTMLAnchorElement>('a.dt-chip-link')?.href).toBe('https://github.com/acme/widgets/pull/42')
-  await click(all('.dt-more-link').at(-1)!)
-  expect(tab(zh['tab.execution']).getAttribute('aria-selected')).toBe('true')
+  const pending = all('.dt-cards .dt-ticket')
+  expect(pending.map(row => row.querySelector('.dt-ticket-stage')?.textContent)).toEqual(['危险操作', '目标或完成标准要变'])
+  expect(text()).toContain('待处理工单')
+  // Opening a pending ticket reads its report word for word on its own page.
+  await click('修复回归')
+  expect(document.querySelector('.dt-page-title h2')?.textContent).toBe('修复回归')
 })
 
-it('re-evaluates or dismisses an unjudged Eval from the problem list', async () => {
+it('names a missing main Session or foreman with the workspace to open one in, linking to the Deployment settings', async () => {
+  server.masterMissing = true; server.foremanMissing = true
   await mount()
-  await click(zh.requeue)
-  expect(server.requests.some(request => request.path === 'triggers/e3/requeue' && request.method === 'POST')).toBe(true)
-  await click(zh.dismiss)
-  expect(server.requests.some(request => request.path === 'decisions/u1/dismiss' && request.method === 'POST')).toBe(true)
-  expect(server.requests.filter(request => request.path === 'overview').length).toBeGreaterThan(2)
+  expect(text()).toContain('缺主会话')
+  expect(text()).toContain('/w/chief')
+  expect(text()).toContain('缺工头')
+  expect(text()).toContain('D:/gongtou')
+  await click(all('.dt-att-what button')[0]!)
+  expect(document.querySelector('.dt-settings-title')?.textContent).toBe(zh['settingsGroup.deployment'])
 })
 
-it('opens the Thread of an unjudged Eval at its Trigger from the problem list', async () => {
+it('collapses a seen problem in this browser only, and shows it again on request (C-38.6)', async () => {
+  server.masterMissing = true
   await mount()
-  await click('评估未完成：这个文案好奇怪')
-  expect(server.requests.some(request => request.path.startsWith('threads/feishu:oc_1:om_root'))).toBe(true)
-  expect(document.querySelector('.dt-highlight')?.textContent).toContain('message e3')
-})
-
-it('follows the last day\'s counts to the status of each stage', async () => {
-  await mount()
-  // Arrived Triggers include filtered ones, which have no Thread, so no list has that count to link to.
-  expect(all('.dt-stat button').map(button => button.textContent)).toEqual(['2', '1'])
-  await click(all('.dt-stat button')[0]!)
-  expect(tab(zh['tab.source']).getAttribute('aria-selected')).toBe('true')
-  await click(zh.sourceFilteredTitle)
-  expect(text()).toContain('looks wrong')
-  expect(text()).toContain(zh['reason.source_disabled'])
-})
-
-it('offers each Ticket that needs a person its actions on the overview: answer in its Channel, retry or open a failed worker, and stop',
-  async () => {
-  await mount()
-  expect(all('.dt-ticket-actions a').map(link => [link.textContent, link.getAttribute('href')])).toEqual([['去飞书回答',
-    'https://applink.feishu.cn/client/chat/open?openChatId=oc_1']])
-  expect(all('.dt-ticket-note').map(note => note.textContent)).toContain('LlmError: no adapter registered for provider "provider-a"')
-  await click(zh.retry)
-  await click(zh.confirm)
-  expect(server.requests.some(request => request.path === 'tickets/t4/retry' && request.method === 'POST')).toBe(true)
-  await click(all('.dt-ticket-actions button').find(button => button.textContent === '打开 Session')!)
-  expect(server.opened).toEqual(['worker-t4'])
-  await click(all('.dt-ticket-actions button').filter(button => button.textContent === '停止').at(-1)!)
-  await click(zh.confirm)
-  expect(server.requests.some(request => request.path === 'tickets/t4/stop' && request.method === 'POST')).toBe(true)
-  expect(text()).not.toContain('截图工具')
-})
-
-it('shows paused processing as a system problem with its resume action, and says so on the Policy records', async () => {
-  server.settings = { ...server.settings, paused: true }
-  await mount()
-  expect(text()).toContain(zh.problemPaused)
-  await click(zh['tab.eval'])
-  expect(text()).toContain(zh.evalRecordsPaused)
-  await click(zh.resumeWhere)
-  expect(tab(zh['tab.execution']).getAttribute('aria-selected')).toBe('true')
-  await click(zh['tab.overview'])
-  await click(find(zh.resumeProcessing, '.dt-att button'))
-  await click(zh.confirm)
-  expect(server.requests.find(request => request.path === 'executor/pause')).toMatchObject({ method: 'POST', body: { paused: false } })
-})
-
-it('offers the step that fixes a settings problem as a button on the overview', async () => {
-  server.settings = { ...server.settings, policy: { ...server.settings.policy, sources: { feishu: { allowed: [], admission: {} },
-    github: { allowed: [], admission: {} } } } }
-  await mount()
-  expect(text()).toContain(zh.problemNoAllowed)
-  await click(zh.actionAddAllowed)
-  expect(tab(zh['tab.settings']).getAttribute('aria-selected')).toBe('true')
-  expect(document.querySelector('.dt-settings-link[aria-current="page"]')?.textContent).toBe(zh['term.eval'])
-})
-
-it('counts the messages not sent in the last day, linking to the Source status, and shows nothing when there are none', async () => {
-  await mount()
-  expect(all('.dt-stat-label').map(label => label.textContent)).not.toContain(zh.flowDroppedLabel)
-  server.dropped = [droppedReply('m2', 1, 'feishu', 'channelGone'), droppedReply('m1', 2, 'github', 'channelIgnored'), droppedReply('m0',
-    30, 'feishu', 'channelGone')]
+  const before = server.requests.length
+  await click(zh.collapse)
+  // Collapsing makes no request and changes no host state.
+  expect(server.requests.length).toBe(before)
+  expect(text()).not.toContain('缺主会话')
+  expect(text()).toContain('已收起 1 条系统问题')
   await remount()
-  const stat = all('.dt-stat').find(item => item.querySelector('.dt-stat-label')?.textContent === zh.flowDroppedLabel)!
-  expect(stat.textContent).toBe(`${zh.flowDroppedLabel}2`)
-  await click(stat.querySelector('button')!)
-  expect(tab(zh['tab.source'])?.getAttribute('aria-selected')).toBe('true')
+  expect(text()).not.toContain('缺主会话')
+  await click('已收起 1 条系统问题 · 展开查看')
+  await click(zh.problemShowAgain)
+  expect(text()).toContain('缺主会话')
 })
 
-it('names a failing part of dsh-superagent itself by its label', async () => {
-  server.health = { launch: { state: 'error', detail: 'spawn failed' }, relay: { state: 'ready', detail: 'Nothing waiting' } }
+it('shows the executor load with a link to the Execution page, and nothing while idle', async () => {
+  server.load = { running: 2, queued: 1 }
   await mount()
-  expect(all('.dt-cards .dt-att-what').map(item => item.textContent)).toContain(zh.problemRuntime.replace('{name}', zh['health.launch']))
-  expect(text()).toContain('spawn failed')
+  expect(text()).toContain('2 / 3')
+  expect(text()).toContain('排队')
+  await click(zh['tab.execution'])
+  expect(all('.dt-filters button').length).toBe(3)
 })
 
-it('words a refused retry in the interface language by its code', async () => {
+it('lists the confirmed instructions read-only and opens one with its own words and tickets', async () => {
   await mount()
-  // Simulate another user retrying the ticket after the overview loaded.
-  server.person = server.person.map(ticket => ticket.id === 't4' ? { ...ticket, actions: { ...ticket.actions, retry: false } } : ticket)
-  await click(find(zh.retry, '.dt-ticket-actions button'))
-  await click(zh.confirm)
-  expect(document.querySelector('.dt-toast')?.textContent).toBe(zh['userError.notRetryable'])
-  expect(text()).not.toContain('Only an open ticket can be retried, and only when its worker last reported failed or blocked and no person has sent a message since, or when delivering an Input to its worker failed')
+  expect(text()).toContain('pr-1')
+  expect(text()).toContain('把登录页错字改一下')
+  await click(all('.dt-open').find(button => button.textContent?.startsWith('pr-1'))!)
+  expect(document.querySelector('.dt-page-title h2')?.textContent).toBe('指令清单 pr-1')
+  // The four times and every task stay readable; confirming happens in the conversation, never here (C-06).
+  expect(text()).toContain('整理于')
+  expect(text()).toContain('确认于')
+  expect(text()).toContain('交给工头')
+  expect(text()).toContain('派出工单')
+  expect(text()).toContain('改登录页错字')
+  expect(text()).toContain('首页加载优化')
+  expect(all('button').some(button => button.textContent === zh.confirm)).toBe(false)
 })
 
-it('shows the overview in English', async () => {
-  await mount(en)
-  expect(all('.dt-section-title').map(title => title.textContent)).toEqual([`${en.pendingTickets}2`, `${en.problems}2`,
-    `${en.lastDay}${en.details}`, `${en['term.executor']}${en.details}`])
-  expect(all('.dt-cards .dt-ticket-stage').map(item => item.textContent)).toEqual([en['stage.answer'], en['stage.failed']])
-  expect(all('.dt-stat-label').map(label => label.textContent)).toEqual([en.flowReceivedLabel, en.flowFilteredLabel, en.flowJudgedLabel,
-    en.flowAcceptedLabel, en.executingLabel, en.queuedLabel, en.idleLabel])
-})
-
-it('lists the unavailable Evals one by one, without the health entry that counts them as a failure of dsh-superagent', async () => {
-  server.health.evals = { state: 'error', detail: '1 Eval(s) unavailable in the last hour without a later judgement' }
+it('shows which main Session is current, its generation and context usage, and opens it', async () => {
+  server.person = []
+  server.master = { id: 'orchestrator-abc123', generation: 2, usage: 0.42 }
   await mount()
-  expect(all('.dt-cards .dt-att-what').map(item => item.textContent)).toEqual(['飞书 来源异常', '评估未完成：这个文案好奇怪'])
-  expect(text()).not.toContain(zh['health.evals'])
+  expect(text()).toContain('orchestrator-abc123')
+  expect(text()).toContain('第 3 代')
+  expect(text()).toContain('42%')
+  await click(zh.openSession)
+  expect(server.opened).toEqual(['orchestrator-abc123'])
 })
 
-it('says when no Source is on, an Eval is past its deadline or a message keeps failing, each with the way to it', async () => {
-  for (const kind of ['feishu', 'github']) server.settings.sources[kind] = { ...server.settings.sources[kind]!, enabled: false }
-  server.threads = [threadSummary({ key: 'github:9', title: '#9 迟迟未决', stage: 'evaluating',
-    evaluating: { id: 'v9', triggers: 1, strength: 'inferred', startedAt: '2026-08-31T23:58:00Z', deadline: '2026-09-01T00:00:00Z' } })]
-  server.failing = [{ id: 'm1', channel: { source: 'github', thread: 'github:42', address: { number: '42' } },
-    text: '已修复', attempts: 4,
-    error: 'HTTP 502 from GitHub' }]
+it('shows the foreman generation, usage, last rotation and a pending rotation', async () => {
+  server.foreman = { session: 'superagent-foreman', generation: 1, pending: true, usage: null,
+    rotatedAt: '2026-11-18T00:00:00Z', open: true }
   await mount()
-  const titles = () => all('.dt-cards .dt-att-what').map(item => item.textContent)
-  // The Feishu Source is off, so its error is no problem any more.
-  expect(titles()).toEqual([zh.problemNoSource, '评估超时未决定：#9 迟迟未决', '评估未完成：这个文案好奇怪', 'GitHub 回复发送失败（已重试 4 次）'])
-  expect(text()).toContain('HTTP 502 from GitHub')
-  await click(zh.actionOpenSources)
-  expect(document.querySelector('.dt-settings-link[aria-current="page"]')?.textContent).toBe(zh['settingsGroup.source'])
-  await click(tab(zh['tab.overview']))
-  await click('评估超时未决定：#9 迟迟未决')
-  expect(server.requests.some(request => request.path.startsWith('threads/github:9'))).toBe(true)
+  expect(text()).toContain('superagent-foreman')
+  expect(text()).toContain('第 2 代')
+  expect(text()).toContain('未记录')
+  expect(text()).toContain('等换代')
+  expect(text()).toContain('最近换代')
+})
+
+it('says all is quiet when nothing waits for the person, and shows the overview in English', async () => {
+  quiet()
+  await mount()
+  expect(text()).toContain(zh.overviewQuiet)
+  expect(text()).not.toContain('待处理工单')
+  await remount(en)
+  expect(text()).toContain('All quiet: nothing waits for the person.')
+  expect(text()).toContain('Main Session')
+  expect(text()).toContain('Foreman')
 })

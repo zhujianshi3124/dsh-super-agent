@@ -1,6 +1,5 @@
 import { describe, expect, it, vi } from 'vitest'
-import { Engine, MemoryRepositories, UserError, followupOwners, key, runningAssignment, ticketOutcome, ticketStage,
-  waitsForPerson } from '../src/core/index.ts'
+import { Engine, MemoryRepositories, UserError, followupOwners, key, runningAssignment, ticketOutcome, ticketStage } from '../src/core/index.ts'
 import type { Assessor, Assignment, Candidate, EngineOptions, Executor, OutboundMessage, Outcome, Policy, Ticket, Trigger } from '../src/core/index.ts'
 
 const member = { source: 'chat', id: 'alice' }
@@ -225,7 +224,7 @@ describe('subscription fan-out', () => {
     expect(h.repo.tickets.get(decision.ticketId!)).toMatchObject({ ended: expect.anything(), undelivered: [] })
     expect(h.executor.start).toHaveBeenCalledOnce()
   })
-  it('resumes once however often it pumps, with the resume note ahead of the message, and drops what waited when the policy no longer holds the mandate', async () => {
+  it('leaves an ended ticket ended however often it pumps, and lets each later message become new work for Eval', async () => {
     const h = harness()
     const decision = accepted(h)
     h.engine.report(decision.ticketId!, { state: 'ready', summary: 'done' })
@@ -237,8 +236,10 @@ describe('subscription fan-out', () => {
     expect(h.repo.tickets.get(decision.ticketId!)!.ended).toBeDefined()
     h.engine.receive(trigger('3', { actor: guest })); h.pump(); h.pump()
     const ticket = h.repo.tickets.get(decision.ticketId!)!
-    expect(ticket.assignments).toHaveLength(2)
-    expect(ticket.inputs.filter(input => input.kind === 'resumed')).toHaveLength(1)
+    expect(ticket.assignments).toHaveLength(1)
+    expect(ticket.inputs.some(input => input.kind === 'resumed')).toBe(false)
+    const thread = h.repo.threads.get('chat:t1')!
+    expect(thread.pending.includes('3') || h.requests.at(-1)!.triggers.some(item => item.id === '3')).toBe(true)
   })
   it('takes delivery reports only from the assignment that still runs the open ticket', () => {
     const h = harness()
@@ -286,30 +287,28 @@ describe('subscription fan-out', () => {
     expect(() => h.engine.markUnrelated(first, 'gh:pr-9', 'its PR')).toThrow(new UserError('followedThread'))
   })
 })
-describe('resume and stop', () => {
+describe('endings and stop', () => {
   async function ended(h: ReturnType<typeof harness>, by: 'executor' | 'human') {
     const decision = accepted(h)
     if (by === 'executor') h.engine.report(decision.ticketId!, { state: 'ready', summary: 'done' })
     else h.engine.stopTicket(decision.ticketId!)
     return decision.ticketId!
   }
-  it('resumes an ended ticket on any person\'s message on its thread, under the same mandate and without a Decision', async () => {
+  it('leaves an ended ticket ended on any person\'s message on its thread, which becomes new work for Eval', async () => {
     const h = harness()
     const ticketId = await ended(h, 'executor')
-    const decisions = h.repo.decisions.byThread('chat:t1').length
-    // It resumes as the message arrives, before any Eval of it.
     h.engine.receive(trigger('2', { actor: guest }))
-    expect(h.repo.tickets.get(ticketId)!.ended).toBeUndefined()
     h.pump()
     const ticket = h.repo.tickets.get(ticketId)!
-    expect(ticket.assignments).toHaveLength(2)
+    expect(ticket.ended).toBeDefined()
+    expect(ticket.assignments).toHaveLength(1)
+    expect(ticket.inputs.some(input => input.kind === 'resumed')).toBe(false)
     expect(ticket.mandate.policyVersion).toBe('v1')
-    expect(ticket.inputs.map(input => input.kind)).toEqual(['trigger', 'resumed'])
-    expect(h.executor.start).toHaveBeenCalledTimes(2)
-    // The message still reaches Eval as a follow-up, but no reopen Decision is needed or possible.
-    expect(h.repo.decisions.byThread('chat:t1').filter(decision => decision.kind !== 'ignore')).toHaveLength(decisions)
+    expect(h.executor.start).toHaveBeenCalledOnce()
+    // The message reaches Eval as a follow-up; no reopen Decision is needed or possible.
+    expect(h.requests.at(-1)!.triggers.map(item => item.id)).toContain('2')
   })
-  it('resumes an ended ticket an earlier version left with a person\'s message waiting, on the next pass', async () => {
+  it('does not restart an ended ticket for a message an earlier version left waiting on it', async () => {
     const h = harness()
     const ticketId = await ended(h, 'executor')
     h.engine.receive(trigger('2', { actor: guest, threads: [{ source: 'chat', id: 'elsewhere' }] }))
@@ -317,16 +316,14 @@ describe('resume and stop', () => {
     const input = { id: 'waiting', kind: 'trigger' as const, triggerId: '2', at: stored.updatedAt, human: true as const }
     h.repo.tickets.save({ ...stored, inputs: [...stored.inputs, input], undelivered: ['waiting'] })
     h.pump()
-    expect(h.repo.tickets.get(ticketId)).toMatchObject({ inputs: expect.arrayContaining([expect.objectContaining({ kind: 'resumed' })]) })
-    expect(h.repo.tickets.get(ticketId)).not.toHaveProperty('ended')
+    expect(h.repo.tickets.get(ticketId)!.ended).toBeDefined()
+    expect(h.repo.tickets.get(ticketId)!.assignments).toHaveLength(1)
   })
-  it('resumes an ended ticket at once when a person attaches a message to it', async () => {
+  it('refuses to attach a message to an ended ticket', async () => {
     const h = harness()
     const ticketId = await ended(h, 'executor')
     h.engine.receive(trigger('2', { actor: guest, threads: [{ source: 'chat', id: 'elsewhere' }] }))
-    const subject = h.engine.attach(ticketId, '2')
-    expect(subject).toMatchObject({ assignments: [expect.anything(), expect.objectContaining({ state: 'pending' })] })
-    expect(subject).not.toHaveProperty('ended')
+    expect(() => h.engine.attach(ticketId, '2')).toThrow(new UserError('ticketEnded'))
   })
   it('keeps a ticket a person stopped ended: the stop withdrew its mandate', async () => {
     const h = harness()
@@ -437,25 +434,22 @@ describe('hand-back', () => {
   })
 })
 describe('context threads and notes', () => {
-  it('fans a Thread followed for context out to the live ticket, resumes no ended ticket from it, unless it was attached', async () => {
+  it('fans a Thread followed for context out to the live ticket, and sends an ended ticket\'s later message to Eval', async () => {
     const h = harness()
     const ticketId = accepted(h).ticketId!
     expect(h.engine.followForContext(ticketId, { source: 'chat', id: 'issue' })).toBe(true)
     expect(h.engine.followForContext(ticketId, { source: 'chat', id: 'issue' })).toBe(false)
     h.engine.receive(trigger('2', { threads: [{ source: 'chat', id: 'issue' }] })); h.settle()
-    expect(h.repo.tickets.get(ticketId)!.inputs.map(input => input.kind === 'trigger' && input.triggerId)).toEqual(['2'])
+    expect(h.repo.tickets.get(ticketId)!.inputs.map(input => input.kind === 'trigger' && input.triggerId).filter(Boolean)).toEqual(['2'])
     h.engine.report(ticketId, { state: 'dropped', summary: 'nothing to do' })
-    h.engine.receive(trigger('3', { threads: [{ source: 'chat', id: 'issue' }] }))
+    h.engine.receive(trigger('3', { threads: [{ source: 'chat', id: 'issue' }] })); h.pump()
     expect(h.repo.tickets.get(ticketId)!.ended).toBeDefined()
-    // Attached by the main Session, the Thread is the ticket's own, and a person's later message there resumes it.
-    h.engine.attach(ticketId, '3'); h.settle()
-    expect(h.repo.threads.get('chat:issue')).toMatchObject({ context: [] })
-    h.engine.report(ticketId, { state: 'dropped', summary: 'nothing to do' })
-    expect(h.repo.tickets.get(ticketId)!.ended).toBeDefined()
-    h.engine.receive(trigger('4', { threads: [{ source: 'chat', id: 'issue' }] }))
-    expect(h.repo.tickets.get(ticketId)!.ended).toBeUndefined()
+    // The ticket takes nothing: the message stays new work for Eval.
+    expect(() => h.engine.attach(ticketId, '3')).toThrow(new UserError('ticketEnded'))
+    const thread = h.repo.threads.get('chat:issue')!
+    expect(thread.evaluating ?? thread.pending.includes('3')).toBeTruthy()
   })
-  it('counts a message on a Thread a ticket follows only for context as none of its follow-ups, and lifts no block with it', () => {
+  it('counts a message on a Thread a ticket follows only for context as none of its follow-ups', () => {
     const h = harness()
     const owner = accepted(h).ticketId!
     const follower = accepted(h, '2', 'other').ticketId!
@@ -464,12 +458,12 @@ describe('context threads and notes', () => {
     expect(h.repo.triggers.disposition('3')).toMatchObject({ fanout: [owner, follower], context: [follower] })
     expect(h.repo.tickets.get(follower)!.inputs.at(-1)).toMatchObject({ triggerId: '3', context: true })
     // On the follower's own Thread no longer: a message reaching only it goes to Eval, with the guest's that the stopped owner
-    // let go of.
+    // let go of. A blocked report without a question is a failure: it ends the follower (N-13).
     h.engine.stopTicket(owner, 'done')
     h.engine.report(follower, { state: 'blocked', summary: 'needs a decision' })
+    expect(h.repo.tickets.get(follower)!.ended).toMatchObject({ by: 'executor', stop: 'failed' })
     h.engine.receive(trigger('4')); h.pump()
     expect(h.requests.at(-1)!.triggers.map(item => item.id)).toEqual(['3', '4'])
-    expect(waitsForPerson(h.repo.tickets.get(follower)!)).toBe(true)
   })
   it('sends a message to Eval when the ticket it reached cannot resume and only a ticket following its Thread for context is left', () => {
     const h = harness()
@@ -482,14 +476,14 @@ describe('context threads and notes', () => {
     expect(h.repo.triggers.disposition('3')).toMatchObject({ fanout: [follower], context: [follower] })
     expect(h.requests.at(-1)!.triggers.map(item => item.id)).toEqual(['3'])
   })
-  it('gives an open ticket\'s worker a note as an Input of its own, held like automatic Input, and refuses one for an ended ticket', () => {
+  it('gives an open ticket\'s worker a note as an Input of its own, held while it waits for adjudication, and refuses one for an ended ticket', () => {
     const h = harness()
     const ticketId = accepted(h).ticketId!
     expect(h.engine.note(ticketId, 'The other ticket renamed the API').inputs.at(-1)).toMatchObject({ kind: 'note',
       text: 'The other ticket renamed the API' })
-    // A worker that reported blocked waits for a person: a note does not wake it.
+    // A worker stopped at a clean node with a question waits for the person: an automatic note does not wake it (C-16a).
     h.settle()
-    h.engine.report(ticketId, { state: 'blocked', summary: 'needs a decision' })
+    h.engine.report(ticketId, { state: 'blocked', summary: 'needs a decision', question: 'Which way?' })
     const note = h.engine.note(ticketId, 'Ticket B changed the schema').inputs.at(-1)!
     h.settle()
     expect(h.delivered.map(([, id]) => id)).not.toContain(note.id)
@@ -538,57 +532,43 @@ describe('follow-up owners', () => {
     // The ticket no longer counts as having reached it, so its candidate names no ticket that gave no reason.
     expect([h.repo.triggers.disposition('2')!.fanout, h.repo.triggers.disposition('3')!.fanout]).toEqual([[ticketId], []])
   })
-  it('keeps a ticket open after its pull request merged while its worker is on a person\'s message it took up after its last report',
-    () => {
-    for (const taken of [true, false]) {
-      const h = harness()
-      const ticketId = accepted(h).ticketId!
-      h.engine.bindThread(ticketId, { source: 'gh', id: 'pr-9' }, true)
-      h.engine.report(ticketId, { state: 'ready', summary: 'PR ready' })
-      // A person asks for one more change, which the worker takes up or has not yet, and the pull request merges meanwhile.
-      h.tick(1); h.engine.receive(trigger('2')); h.settle()
-      if (taken) h.engine.reply({ purpose: 'acknowledgement', ticketId, triggerId: '2', text: 'On it' })
-      h.engine.threadClosed({ source: 'gh', id: 'pr-9' }, 'merged', '2026-09-23T00:00:01Z')
-      // One it has not taken up leaves the merge to end the ticket, and goes to Eval.
-      expect([h.repo.tickets.get(ticketId)!.ended?.outcome, h.repo.threads.get('chat:t1')!.pending]).toEqual(taken ? [undefined, []]
-        : ['merged', ['2']])
-      // The worker's ready report ends it as the pull request did.
-      if (taken) h.engine.report(ticketId, { state: 'ready', summary: 'Done' })
-      expect(h.repo.tickets.get(ticketId)!.ended).toMatchObject({ outcome: 'merged' })
-    }
+  it('ends a ticket on its ready report; a later merge changes nothing and a later message is new work for Eval', () => {
+    const h = harness()
+    const ticketId = accepted(h).ticketId!
+    h.engine.bindThread(ticketId, { source: 'gh', id: 'pr-9' }, true)
+    h.engine.report(ticketId, { state: 'ready', summary: 'PR ready' })
+    // Delivery ends the ticket at once (N-13); the pull request merging afterwards changes nothing.
+    expect(h.repo.tickets.get(ticketId)!.ended).toMatchObject({ by: 'executor', outcome: 'completed', stop: 'delivered' })
+    h.tick(1); h.engine.receive(trigger('2')); h.settle()
+    h.engine.threadClosed({ source: 'gh', id: 'pr-9' }, 'merged', '2026-09-23T00:00:01Z')
+    expect(h.repo.tickets.get(ticketId)!.ended).toMatchObject({ outcome: 'completed' })
+    // A person's later message is new work for Eval, never a reopening (C-11).
+    expect(h.repo.threads.get('chat:t1')!.pending).toEqual(['2'])
+    h.pump()
+    expect(h.requests.at(-1)!.triggers.map(item => item.id)).toEqual(['2'])
   })
-  it('gives a follow-up its ended ticket let go to that ticket again when the main Session attaches it there', () => {
-    for (const resumed of [false, true]) {
-      const h = harness()
-      const ticketId = accepted(h).ticketId!
-      // The ticket ends before its worker took up a person's message, which goes to Eval; a later message may resume it.
-      h.engine.report(ticketId, { state: 'progress', summary: 'working' })
-      h.tick(1); h.engine.receive(trigger('2')); h.settle()
-      h.engine.report(ticketId, { state: 'dropped', summary: 'nothing to do' })
-      if (resumed) { h.tick(1); h.engine.receive(trigger('3')) }
-      h.pump()
-      h.tick(1); h.engine.attach(ticketId, '2'); h.settle()
-      // Its worker gets the message again, and an ended ticket resumes for it.
-      const copies = h.repo.tickets.get(ticketId)!.inputs.filter(input => input.kind === 'trigger' && input.triggerId === '2')
-      expect(h.delivered).toContainEqual([ticketId, copies[1]?.id])
-      expect(h.repo.tickets.get(ticketId)!.ended).toBeUndefined()
-      expect(followupOwners(trigger('2'), h.repo)).toEqual([ticketId])
-    }
+  it('sends a follow-up its ended ticket let go to Eval, and refuses to attach it to the ended ticket', () => {
+    const h = harness()
+    const ticketId = accepted(h).ticketId!
+    h.engine.report(ticketId, { state: 'progress', summary: 'working' })
+    h.tick(1); h.engine.receive(trigger('2')); h.settle()
+    h.engine.report(ticketId, { state: 'dropped', summary: 'nothing to do' })
+    expect(h.repo.threads.get('chat:t1')!.pending).toEqual(['2'])
+    expect(() => h.engine.attach(ticketId, '2')).toThrow(new UserError('ticketEnded'))
+    expect(followupOwners(trigger('2'), h.repo)).toEqual([])
   })
-  it('wakes an ended ticket for a message attached to it that its worker read only for context or before its last report', () => {
+  it('refuses to attach a message to an ended ticket, whether its worker read it for context or before its last report', () => {
     for (const read of ['context', 'report'] as const) {
       const h = harness()
       const ticketId = accepted(h).ticketId!
       if (read === 'context') h.engine.followForContext(ticketId, { source: 'chat', id: 'issue' })
       h.tick(1); h.engine.receive(trigger('2', { threads: [{ source: 'chat', id: read === 'context' ? 'issue' : 't1' }] })); h.settle()
-      // The worker reports after reading it and drops the ticket; a person sends a follow-up it had to Eval from the panel.
       h.tick(1); h.engine.report(ticketId, { state: 'progress', summary: 'read it' })
       h.engine.report(ticketId, { state: 'dropped', summary: 'nothing to do' })
       if (read === 'report') h.engine.reevaluate('2')
       h.pump()
-      h.tick(1); h.engine.attach(ticketId, '2'); h.settle()
-      expect(h.repo.tickets.get(ticketId)!.ended).toBeUndefined()
-      expect(followupOwners(h.repo.triggers.get('2')!, h.repo)).toEqual([ticketId])
+      expect(() => h.engine.attach(ticketId, '2')).toThrow(new UserError('ticketEnded'))
+      expect(h.repo.tickets.get(ticketId)!.ended).toBeDefined()
     }
   })
   it('counts a question the final report answers as taken up, so it does not come back as a candidate beside its answer', () => {
@@ -617,15 +597,14 @@ describe('follow-up owners', () => {
     h.engine.report(ticketId, { state: 'dropped', summary: 'nothing to do' })
     expect([h.repo.threads.get('chat:t1')!.pending, h.repo.triggers.disposition('2')!.fanout]).toEqual([[], [ticketId]])
   })
-  it('counts a message that resumed a ticket as taken up by the report that ends it again, unlike one that came later', () => {
+  it('counts a message its worker read as taken up by the report that drops the ticket, unlike one that came later', () => {
     const h = harness()
     const ticketId = accepted(h).ticketId!
-    h.engine.report(ticketId, { state: 'ready', summary: 'done' })
-    // A person's thanks resumes the ticket, and its worker takes it into a step first, a moment after its Assignment started,
-    // as the Executor delivers it; a request comes while it reports that nothing is left.
-    h.tick(1); h.engine.receive(trigger('2'))
-    h.tick(1); h.engine.assignmentStarted(ticketId, h.repo.tickets.get(ticketId)!.assignments.at(-1)!.id)
-    h.tick(1); h.settle(); h.read(ticketId)
+    h.engine.report(ticketId, { state: 'progress', summary: 'working' })
+    // A person's thanks reaches the worker and its step takes it, as the Executor delivers it; a request comes while it
+    // reports that nothing is left.
+    h.tick(1); h.engine.receive(trigger('2')); h.settle()
+    h.read(ticketId)
     h.tick(1); h.engine.receive(trigger('3')); h.settle()
     h.engine.report(ticketId, { state: 'dropped', summary: 'nothing to do' })
     expect(h.repo.threads.get('chat:t1')!.pending).toEqual(['3'])
@@ -792,14 +771,13 @@ describe('worker reports', () => {
     expect(cleared).not.toHaveProperty('attention')
     expect(h.withdrawn).toEqual([key('attention-reply', asked.attention!.id), key('attention-reply', replaced.attention!.id)])
   })
-  it('ends the ticket on a final report: dropped drops it, ready completes it unless it follows a Source\'s Thread that is open', () => {
+  it('ends the ticket on a final report: ready and dropped deliver, and a followed Thread\'s close names the legacy outcome', () => {
     const outcome = (state: 'ready' | 'dropped' | 'failed', follows: boolean, closed = false) => {
       const h = harness()
       const ticketId = accepted(h).ticketId!
       h.engine.report(ticketId, { state: 'progress', summary: 'asking', question: 'Merge it?' })
       if (follows) h.engine.bindThread(ticketId, { source: 'gh', id: 'pr-9' }, false)
       if (follows) h.engine.bindThread(ticketId, { source: 'gh', id: 'pr-10' }, true)
-      // Work resumed after both closed ends with its ready report, using the latest close outcome.
       if (closed) {
         h.engine.threadClosed({ source: 'gh', id: 'pr-9' }, 'closed', '2026-09-22T00:00:00Z')
         h.engine.threadClosed({ source: 'gh', id: 'pr-10' }, 'merged', '2026-09-22T00:00:01Z')
@@ -807,17 +785,36 @@ describe('worker reports', () => {
       h.engine.report(ticketId, { state, summary: 'done' })
       return h.repo.tickets.get(ticketId)!
     }
-    expect(outcome('dropped', true)).toMatchObject({ ended: { by: 'executor', outcome: 'dropped' } })
+    expect(outcome('dropped', true)).toMatchObject({ ended: { by: 'executor', outcome: 'dropped', stop: 'delivered' } })
     expect(outcome('dropped', true).ended).not.toHaveProperty('reason')
-    expect(outcome('ready', false)).toMatchObject({ ended: { outcome: 'completed' } })
+    expect(outcome('ready', false)).toMatchObject({ ended: { outcome: 'completed', stop: 'delivered' } })
     expect(outcome('ready', false)).not.toHaveProperty('attention')
+    // A ready report delivers even while a followed Thread is still open (N-13); the close only names the legacy outcome.
     expect(outcome('ready', true)).toMatchObject({ follows: [{ thread: 'gh:pr-9', own: false }, { thread: 'gh:pr-10', own: true }],
+      ended: { outcome: 'completed', stop: 'delivered' },
       assignments: [expect.objectContaining({ report: expect.objectContaining({ state: 'ready' }) })] })
-    expect(outcome('ready', true)).not.toHaveProperty('ended')
     expect(outcome('ready', true)).not.toHaveProperty('attention')
-    expect(outcome('ready', true, true)).toMatchObject({ ended: { outcome: 'merged' } })
-    expect(outcome('failed', false)).toMatchObject({ attention: { question: 'Merge it?' } })
-    expect(outcome('failed', false)).not.toHaveProperty('ended')
+    expect(outcome('ready', true, true)).toMatchObject({ ended: { outcome: 'merged', stop: 'delivered' } })
+    expect(outcome('failed', false)).toMatchObject({ ended: { by: 'executor', outcome: 'stopped', stop: 'failed' } })
+    expect(outcome('failed', false)).not.toHaveProperty('attention')
+  })
+  it('ends a ticket session-stopped when the Executor says the session stopped working (N-13b)', () => {
+    const h = harness()
+    const ticketId = accepted(h).ticketId!
+    h.engine.report(ticketId, { state: 'failed', summary: 'rate limited', stopReason: 'session-stopped' })
+    expect(h.repo.tickets.get(ticketId)!.ended).toMatchObject({ by: 'system', outcome: 'stopped', stop: 'session-stopped', reason: 'rate limited' })
+  })
+  it('a blocked report with a question keeps the ticket open; without one it ends failed (C-16a, N-13)', () => {
+    const h = harness()
+    const ticketId = accepted(h).ticketId!
+    const asked = h.engine.report(ticketId, { state: 'blocked', summary: 'needs a decision', question: 'Which way?' })
+    expect(asked).not.toHaveProperty('ended')
+    expect(asked.attention).toMatchObject({ question: 'Which way?' })
+    expect(ticketStage(asked)).toEqual({ stage: 'adjudication' })
+    const other = accepted(h, '2', 't2').ticketId!
+    const ended = h.engine.report(other, { state: 'blocked', summary: 'needs a decision' })
+    expect(ended.ended).toMatchObject({ by: 'executor', stop: 'failed' })
+    expect(ended).not.toHaveProperty('attention')
   })
   it('refuses a question with a result or an answer, and questions or answers that name no person\'s message of the ticket', () => {
     const h = harness()
@@ -850,7 +847,7 @@ describe('outcomes', () => {
   })
 })
 describe('attach', () => {
-  it('sends the routing note for a message the worker has, ends an Eval that holds only that message, and refuses a ticket a person stopped or the Policy no longer holds', () => {
+  it('sends the routing note for a message the worker has, ends an Eval that holds only that message, and refuses an ended or stopped ticket', () => {
     const h = harness()
     const ticketId = accepted(h).ticketId!
     h.engine.receive(trigger('2', { actor: guest })); h.pump()
@@ -870,9 +867,7 @@ describe('attach', () => {
     expect(h.engine.attach(ticketId, '5', 'Same fix again').inputs.at(-1)).toMatchObject({ triggerId: '5', note: 'Same fix again' })
     h.settle()
     h.engine.report(ticketId, { state: 'ready', summary: 'done' })
-    h.setVersion('revoked')
-    expect(() => h.engine.attach(ticketId, '2')).toThrow(new UserError('mandateRevoked'))
-    h.setVersion('v1')
+    expect(() => h.engine.attach(ticketId, '2')).toThrow(new UserError('ticketEnded'))
     const stopped = accepted(h, '3', 't3').ticketId!
     h.engine.stopTicket(stopped)
     expect(() => h.engine.attach(stopped, '2')).toThrow(new UserError('ticketStopped'))
@@ -962,47 +957,39 @@ describe('direct decisions', () => {
 
 })
 describe('automatic input', () => {
-  it('holds back automatic Input from a worker that reported blocked or failed until a person\'s message arrives', () => {
+  it('holds back automatic Input while a worker waits at a clean node for adjudication (C-16a)', () => {
     const h = harness()
     const ticketId = accepted(h).ticketId!
     const bot = (id: string) => trigger(id, { human: false })
-    h.engine.receive(bot('2'))
-    h.engine.report(ticketId, { state: 'blocked', summary: 'needs a decision' })
-    // Both pending and subsequent automated inputs stay queued on the ticket without waking the worker.
-    h.engine.receive(bot('3')); h.settle()
+    h.engine.report(ticketId, { state: 'blocked', summary: 'needs a decision', question: 'Which way?' })
+    // Automated inputs stay on the ticket without waking the worker that waits for the person.
+    h.engine.receive(bot('2')); h.engine.receive(bot('3')); h.settle()
     expect(h.repo.tickets.get(ticketId)).toMatchObject({ undelivered: [], inputs: [expect.objectContaining({ triggerId: '2' }), expect.objectContaining({ triggerId: '3' })] })
     expect(h.delivered).toEqual([])
+    // A person's message is delivered even while the question waits.
     h.tick(1)
-    h.engine.receive(trigger('4', { actor: guest })); h.engine.receive(bot('5')); h.settle()
-    expect(h.delivered.map(([, input]) => input)).toEqual([key('input', ticketId, 'trigger', '4'), key('input', ticketId, 'trigger', '5')])
+    h.engine.receive(trigger('4', { actor: guest })); h.settle()
+    expect(h.delivered.map(([, input]) => input)).toEqual([key('input', ticketId, 'trigger', '4')])
   })
-  it('stops waiting for a person on a person\'s message, a later report that is neither blocked nor failed, or a retry', () => {
+  it('shows adjudication while a question waits, and working once the person\'s adjudication resumes it', () => {
     const h = harness()
     const ticketId = accepted(h).ticketId!
     const ticket = () => h.repo.tickets.get(ticketId)!
-    h.engine.report(ticketId, { state: 'blocked', summary: 'needs a decision' })
-    expect(waitsForPerson(ticket())).toBe(true)
-    expect(ticketStage(ticket())).toEqual({ stage: 'person', action: 'blocked' })
-    // The worker has the person's reply, so the stale blocked report no longer holds the ticket.
-    h.tick(1); h.engine.receive(trigger('2', { actor: guest })); h.settle()
-    expect(waitsForPerson(ticket())).toBe(false)
+    h.engine.report(ticketId, { state: 'blocked', summary: 'needs a decision', question: 'Which way?' })
+    expect(ticketStage(ticket())).toEqual({ stage: 'adjudication' })
+    // The ticket never ended, so the resume is no reopening (C-11, C-16a).
+    h.engine.resumeTicket(ticketId, 'Use the old API')
     expect(ticketStage(ticket())).toEqual({ stage: 'working' })
-    h.tick(1); h.engine.report(ticketId, { state: 'failed', summary: 'broke' })
-    expect(waitsForPerson(ticket())).toBe(true)
-    h.tick(1); h.engine.report(ticketId, { state: 'progress', summary: 'found a way' })
-    expect(waitsForPerson(ticket())).toBe(false)
-    h.tick(1); h.engine.report(ticketId, { state: 'blocked', summary: 'needs access' })
-    h.engine.retryTicket(ticketId)
-    expect(waitsForPerson(ticket())).toBe(false)
+    expect(ticket()).not.toHaveProperty('attention')
+    expect(ticket().inputs.at(-1)).toMatchObject({ kind: 'text', text: 'Use the old API' })
   })
-  it('launches a failed launch again for a person\'s message, but not for a Policy change', () => {
+  it('launches a pending Assignment again when a person\'s message arrives', () => {
     const h = harness()
-    h.engine.receive(trigger('1')); h.pump()
+    h.engine.receive(trigger('1')); h.engine.evaluateDue()
     const ticketId = h.decide(h.requests.at(-1)!, { kind: 'accept', title: 'Fix', scope: 'small', reason: 'requested' }).ticketId!
-    h.engine.report(ticketId, { state: 'failed', summary: 'The prepare command failed' })
+    // The launch has not started yet: the Assignment stays pending.
+    expect(h.repo.tickets.get(ticketId)!.assignments[0]).toMatchObject({ state: 'pending' })
     vi.mocked(h.executor.start).mockClear()
-    h.setVersion('v2'); h.engine.policyChanged('v1', 'v2')
-    expect(h.executor.start).not.toHaveBeenCalled()
     h.tick(1); h.engine.receive(trigger('2', { actor: guest }))
     expect(h.executor.start).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ id: ticketId }), expect.objectContaining({ state: 'pending' }))
   })
@@ -1058,21 +1045,21 @@ describe('ticket commands', () => {
     h.engine.bindThread(ticketId, { source: 'gh', id: 'pr-7' }, true)
     h.engine.threadClosed({ source: 'gh', id: 'pr-7' }, 'merged', '2026-09-23T00:00:00Z')
     expect(h.repo.tickets.get(ticketId)!.ended).toMatchObject({ outcome: 'merged' })
-    // A person's comment resumes it; its ready report ends it again as its own PR did, though the one it started from is open.
+    // A person's comment no longer resumes it: the ticket stays ended, and the comment becomes new work for Eval.
     h.tick(10); h.engine.receive(trigger('2', { threads: [{ source: 'gh', id: 'pr-5' }] })); h.settle()
-    expect(h.repo.tickets.get(ticketId)).not.toHaveProperty('ended')
-    h.engine.report(ticketId, { state: 'ready', summary: 'Answered' })
     expect(h.repo.tickets.get(ticketId)!.ended).toMatchObject({ outcome: 'merged' })
+    expect(h.repo.tickets.get(ticketId)!.assignments).toHaveLength(1)
+    expect(h.repo.threads.get('gh:pr-5')!.pending).toContain('2')
     // The PR it started from closing later changes nothing.
     h.engine.threadClosed({ source: 'gh', id: 'pr-5' }, 'closed', '2026-09-23T00:00:30Z')
     expect(h.repo.tickets.get(ticketId)!.ended).toMatchObject({ outcome: 'merged' })
-    // A ticket that opened no PR ends when the one it follows closes, as it did.
+    // A ticket that opened no PR ends on its ready report; the Thread it follows closing later changes nothing.
     const other = accepted(h, '3', 't3').ticketId!
     h.engine.bindThread(other, { source: 'gh', id: 'pr-8' }, false)
     h.engine.report(other, { state: 'ready', summary: 'Pushed to their branch' })
-    expect(h.repo.tickets.get(other)).not.toHaveProperty('ended')
+    expect(h.repo.tickets.get(other)!.ended).toMatchObject({ outcome: 'completed', stop: 'delivered' })
     h.engine.threadClosed({ source: 'gh', id: 'pr-8' }, 'closed', '2026-09-23T00:01:00Z')
-    expect(h.repo.tickets.get(other)!.ended).toMatchObject({ outcome: 'closed' })
+    expect(h.repo.tickets.get(other)!.ended).toMatchObject({ outcome: 'completed' })
   })
   it('stops following a Thread whose Subscription a person removes', () => {
     const h = harness()
@@ -1104,31 +1091,28 @@ describe('ticket commands', () => {
     expect(h.repo.tickets.get(ticketId)).toMatchObject({ ended: { by: 'executor', outcome: 'merged', at: '2026-09-23T00:00:01.000Z' } })
     expect(close('pr-10', 'merged', '2026-09-23T00:00:01Z')).toEqual([])
     expect(() => h.engine.bindThread(ticketId, { source: 'gh', id: 'pr-11' }, true)).toThrow(new UserError('ticketEnded'))
-    // A ticket retried after its PR closed but before the close was reported works on until it reports ready.
+    // A failed report ends its ticket at once; the close of its PR afterwards changes nothing (C-11, N-13).
     const other = accepted(h, '2', 't2').ticketId!
     h.engine.bindThread(other, { source: 'gh', id: 'pr-12' }, true)
     h.engine.report(other, { state: 'failed', summary: 'tests fail' })
-    h.tick(10); h.engine.retryTicket(other)
+    expect(h.repo.tickets.get(other)!.ended).toMatchObject({ by: 'executor', stop: 'failed' })
+    h.tick(10)
     expect(close('pr-12', 'closed', '2026-09-23T00:00:05Z')).toEqual([])
-    expect(h.repo.tickets.get(other)!.ended).toBeUndefined()
-    h.engine.report(other, { state: 'ready', summary: 'done' })
-    expect(h.repo.tickets.get(other)).toMatchObject({ ended: { outcome: 'closed' } })
+    expect(h.repo.tickets.get(other)!.ended).toMatchObject({ stop: 'failed' })
   })
 
-  it('retries a ticket that reported failed with a new Assignment, and asks only a waiting worker for its status', () => {
+  it('asks only a waiting worker for its status; a failed report ends the ticket with no retry', () => {
     const h = harness()
     const ticketId = accepted(h).ticketId!
-    expect(() => h.engine.retryTicket(ticketId)).toThrow(new UserError('notRetryable'))
     expect(h.engine.requestStatus(ticketId)).toBe(false)
     expect(h.repo.tickets.get(ticketId)!.inputs).toEqual([])
     h.engine.report(ticketId, { state: 'waiting', summary: 'idle' })
     expect(h.engine.requestStatus(ticketId)).toBe(true)
     expect(h.repo.tickets.get(ticketId)!.inputs).toEqual([expect.objectContaining({ kind: 'text', text: expect.stringContaining('status-only') })])
+    // There is no retry: a failed report ends the ticket, and continuing its task takes a new ticket (C-11, N-13a).
     h.engine.report(ticketId, { state: 'failed', summary: 'broke' })
-    const retried = h.engine.retryTicket(ticketId)
-    expect(retried.assignments).toEqual([expect.objectContaining({ state: 'ended', endedReason: 'retried' }), expect.objectContaining({ state: 'pending' })])
-    expect(h.executor.stop).toHaveBeenCalledOnce()
-    expect(h.executor.start).toHaveBeenLastCalledWith(expect.objectContaining({ id: ticketId }), retried.assignments[1])
+    expect(h.repo.tickets.get(ticketId)!.ended).toMatchObject({ by: 'executor', stop: 'failed' })
+    expect(h.engine.requestStatus(ticketId)).toBe(false)
   })
 })
 describe('failed deliveries', () => {
@@ -1140,8 +1124,8 @@ describe('failed deliveries', () => {
       expect(h.repo.tickets.get(ticketId)!.delivery).toMatchObject({ error: 'Session busy' })
     }
     failed()
-    h.engine.report(ticketId, { state: 'blocked', summary: 'needs access' })
-    h.engine.retryTicket(ticketId); h.settle()
+    // A host restart replaces the Assignment, which takes the waiting Inputs and forgets the failure.
+    h.engine.assignmentInterrupted(ticketId, runningAssignment(h.repo.tickets.get(ticketId)!)!.id); h.settle()
     expect(h.repo.tickets.get(ticketId)).not.toHaveProperty('delivery')
     failed()
     h.engine.stopTicket(ticketId)
@@ -1159,21 +1143,16 @@ describe('problems', () => {
     expect(h.repo.decisions.get(unavailable.id)).toMatchObject({ dismissed: true })
   })
 })
-describe('retry after a failed delivery', () => {
-  it('starts a new Assignment for a ticket whose Input keeps failing to reach its worker, which takes the Input', () => {
+describe('a failed ticket takes no further Input', () => {
+  it('ends the ticket on its failed report, and a later person\'s message becomes new work for Eval', () => {
     const h = harness()
     const ticketId = accepted(h).ticketId!
     h.engine.report(ticketId, { state: 'failed', summary: 'tests fail' })
-    // A person's answer goes to the failed worker, and delivering it fails.
-    h.tick(5); h.engine.receive(trigger('2'))
-    const answered = h.repo.tickets.get(ticketId)!
-    expect(answered.undelivered).toHaveLength(1)
-    h.engine.deliveryFailed(ticketId, runningAssignment(answered)!.id, 'Session gone')
-    expect(ticketStage(h.repo.tickets.get(ticketId)!)).toEqual({ stage: 'person', action: 'delivery' })
-    const retried = h.engine.retryTicket(ticketId)
-    expect(retried.assignments.map(item => item.state)).toEqual(['ended', 'pending'])
-    expect(retried).not.toHaveProperty('delivery')
-    expect(retried.undelivered).toHaveLength(1)
+    expect(h.repo.tickets.get(ticketId)!.ended).toMatchObject({ by: 'executor', stop: 'failed' })
+    // A person's later message reaches no live ticket: it is new work, never a delivery to the ended one (C-11, N-13a).
+    h.tick(5); h.engine.receive(trigger('2')); h.pump()
+    expect(h.repo.tickets.get(ticketId)!.undelivered).toEqual([])
+    expect(h.requests.at(-1)!.triggers.map(item => item.id)).toEqual(['2'])
   })
 })
 describe('Evals across Policy versions, revoked Mandates and mixed batches', () => {
@@ -1198,13 +1177,14 @@ describe('Evals across Policy versions, revoked Mandates and mixed batches', () 
     expect(h.repo.threads.get('chat:t1')!.pending).toEqual(['2'])
     expect(followupOwners(trigger('2'), h.repo)).toEqual([])
   })
-  it('queues a person\'s message that waited out a pause for Eval when the ticket it reached cannot resume once the pause lifts', () => {
+  it('queues a person\'s message for Eval when the ticket it reached ended while the message waited out a pause', () => {
     const h = harness()
     const ticketId = accepted(h).ticketId!
     h.engine.report(ticketId, { state: 'ready', summary: 'Done' }); h.settle()
     h.setPaused(true)
     h.tick(5); h.engine.receive(trigger('2')); h.pump()
-    expect(h.repo.tickets.get(ticketId)!.undelivered).toHaveLength(1)
+    expect(h.repo.tickets.get(ticketId)!.undelivered).toEqual([])
+    expect(h.repo.threads.get('chat:t1')!.pending).toContain('2')
     h.setVersion('revoked'); h.setPaused(false); h.engine.evaluateDue()
     expect(h.repo.tickets.get(ticketId)).toMatchObject({ undelivered: [], ended: expect.anything() })
     expect(h.repo.threads.get('chat:t1')!.pending.includes('2') || h.engine.candidate('2') !== undefined).toBe(true)
@@ -1238,12 +1218,11 @@ describe('gaps', () => {
     named.pump()
     expect(named.repo.threads.get('chat:t1')!.evaluating).toMatchObject({ actor: { id: 'carol' }, basis: { sender: 'carol' }, primary: '2' })
   })
-  it('changes nothing and delivers nothing on a late start of an Assignment a retry replaced', () => {
+  it('changes nothing and delivers nothing on a late start of an Assignment the end replaced', () => {
     const h = harness()
     const ticketId = accepted(h).ticketId!
     const first = h.repo.tickets.get(ticketId)!.assignments[0]!.id
     h.engine.report(ticketId, { state: 'failed', summary: 'broke' })
-    h.engine.retryTicket(ticketId)
     const before = h.repo.tickets.get(ticketId)!
     const delivered = h.delivered.length
     h.engine.assignmentStarted(ticketId, first); h.settle({ launch: false })
@@ -1268,12 +1247,13 @@ describe('gaps', () => {
     expect(h.repo.threads.get('chat:t1')!.pending).toEqual(pending)
     expect(h.repo.decisions.byThread('chat:t1')).toEqual([])
   })
-  it('refuses to retry a ticket a person stopped after its failed report', () => {
+  it('keeps a failed ticket ended; a later stop changes nothing (C-11)', () => {
     const h = harness()
     const ticketId = accepted(h).ticketId!
     h.engine.report(ticketId, { state: 'failed', summary: 'broke' })
+    expect(h.repo.tickets.get(ticketId)!.ended).toMatchObject({ by: 'executor', stop: 'failed' })
     h.engine.stopTicket(ticketId)
-    expect(() => h.engine.retryTicket(ticketId)).toThrow(new UserError('notRetryable'))
+    expect(h.repo.tickets.get(ticketId)!.ended).toMatchObject({ by: 'executor', stop: 'failed' })
   })
   it('answers a question once, sends a result only for finished work, and the same result once', () => {
     const h = harness()
@@ -1371,54 +1351,57 @@ describe('final review: close times', () => {
   })
 })
 describe('model-surface review', () => {
-  it('resumes an ended ticket only on a person\'s message, not on a bot\'s that is attached to it', () => {
+  it('leaves an ended ticket ended on a bot\'s attached message and on a person\'s message', () => {
     const h = harness()
     const ticketId = accepted(h).ticketId!
     h.engine.report(ticketId, { state: 'ready', summary: 'Done' })
     h.tick(1); h.engine.receive(trigger('2', { human: false, actor: { source: 'chat', id: 'ci' }, threads: [{ source: 'chat', id: 'ci' }] }))
-    h.engine.attach(ticketId, '2')
+    expect(() => h.engine.attach(ticketId, '2')).toThrow(new UserError('ticketEnded'))
     expect(h.repo.tickets.get(ticketId)!.ended).toBeDefined()
-    // A person's message resumes it, with what waited.
-    h.tick(1); h.engine.receive(trigger('3'))
-    expect(h.repo.tickets.get(ticketId)!.ended).toBeUndefined()
+    // A person's message becomes new work for Eval; it does not wake the ticket.
+    h.tick(1); h.engine.receive(trigger('3')); h.pump()
+    expect(h.repo.tickets.get(ticketId)!.ended).toBeDefined()
+    expect(h.requests.at(-1)!.triggers.map(item => item.id)).toContain('3')
   })
 })
 describe('follow-up review: turn ends', () => {
   const merge = (h: ReturnType<typeof harness>) => h.engine.threadClosed({ source: 'gh', id: 'pr-9' }, 'merged', '2026-09-23T00:00:01Z')
-  it('lets a merge send to Eval only the messages its worker had no turn to read after its ready report', () => {
+  it('ends the ticket on its ready report, and later messages become new work for Eval', () => {
     const h = harness()
     const ticketId = accepted(h).ticketId!
     h.engine.bindThread(ticketId, { source: 'gh', id: 'pr-9' }, true)
     h.engine.report(ticketId, { state: 'ready', summary: 'PR ready' })
-    // A person thanks the worker, which reads it in a turn and leaves it; another message comes after that turn.
-    h.tick(1); h.engine.receive(trigger('2')); h.settle(); h.read(ticketId)
-    h.tick(1); h.engine.turnEnded(ticketId, runningAssignment(h.repo.tickets.get(ticketId)!)!.id)
+    expect(h.repo.tickets.get(ticketId)!.ended).toMatchObject({ stop: 'delivered' })
+    // Messages that arrive after the end reach no live ticket: each is new work, and the merge changes nothing.
+    h.tick(1); h.engine.receive(trigger('2')); h.settle()
     h.tick(1); h.engine.receive(trigger('3')); h.settle()
     merge(h)
-    expect(h.repo.threads.get('chat:t1')!.pending).toEqual(['3'])
+    expect(h.repo.threads.get('chat:t1')!.pending).toEqual(['2', '3'])
   })
   it('keeps a ticket open at a merge while its worker works on a message it took up, also after a progress report', () => {
     const h = harness()
     const ticketId = accepted(h).ticketId!
     h.engine.bindThread(ticketId, { source: 'gh', id: 'pr-9' }, true)
-    h.engine.report(ticketId, { state: 'ready', summary: 'PR ready' })
     h.tick(1); h.engine.receive(trigger('2')); h.settle()
     h.engine.reply({ purpose: 'acknowledgement', ticketId, triggerId: '2', text: 'On it' })
-    // It answers another question in a progress report while it works on the message.
-    h.tick(1); h.engine.report(ticketId, { state: 'progress', summary: 'Answered the other question' })
+    // It works on the message it took up while the pull request merges: the close does not end unfinished work.
+    h.tick(1); h.engine.report(ticketId, { state: 'progress', summary: 'Working on the message' })
     merge(h)
     expect(h.repo.tickets.get(ticketId)!.ended).toBeUndefined()
+    // Its ready report ends it as the pull request did.
+    h.engine.report(ticketId, { state: 'ready', summary: 'Done' })
+    expect(h.repo.tickets.get(ticketId)!.ended).toMatchObject({ outcome: 'merged', stop: 'delivered' })
   })
-  it('ends a ticket whose close it deferred as the close did when its worker then drops the work', () => {
+  it('ends a ticket whose close it deferred as the close did when its worker then reports dropped', () => {
     const h = harness()
     const ticketId = accepted(h).ticketId!
     h.engine.bindThread(ticketId, { source: 'gh', id: 'pr-9' }, true)
-    h.engine.report(ticketId, { state: 'ready', summary: 'PR ready' })
     h.tick(1); h.engine.receive(trigger('2')); h.settle()
     h.engine.reply({ purpose: 'acknowledgement', ticketId, triggerId: '2', text: 'On it' })
     merge(h)
+    expect(h.repo.tickets.get(ticketId)!.ended).toBeUndefined()
     h.engine.report(ticketId, { state: 'dropped', summary: 'Nothing more to do' })
-    expect(h.repo.tickets.get(ticketId)!.ended).toMatchObject({ outcome: 'merged' })
+    expect(h.repo.tickets.get(ticketId)!.ended).toMatchObject({ outcome: 'merged', stop: 'delivered' })
   })
   it('sends a message another ticket handed back to Eval when a stop on it ends the ticket that kept it', () => {
     const h = harness()
@@ -1484,51 +1467,49 @@ describe('routing review', () => {
 })
 
 describe('what a worker read', () => {
-  /** A ticket that ended, resumed by a person's message `2`, whose new Assignment started; its Inputs wait for delivery. */
-  function resumed() {
+  /** A live ticket working, and a person's message `2` waiting for delivery to its running Assignment. */
+  function followed() {
     const h = harness()
     const ticketId = accepted(h).ticketId!
-    h.engine.report(ticketId, { state: 'ready', summary: 'done' })
+    h.engine.report(ticketId, { state: 'progress', summary: 'working' })
     h.tick(1); h.engine.receive(trigger('2'))
-    const assignmentId = h.repo.tickets.get(ticketId)!.assignments.at(-1)!.id
-    h.tick(1); h.engine.assignmentStarted(ticketId, assignmentId)
-    const [note, message] = h.repo.tickets.get(ticketId)!.undelivered as [string, string]
-    return { h, ticketId, assignmentId, note, message, pending: () => h.repo.threads.get('chat:t1')!.pending }
+    const assignmentId = runningAssignment(h.repo.tickets.get(ticketId)!)!.id
+    const [message] = h.repo.tickets.get(ticketId)!.undelivered as [string]
+    return { h, ticketId, assignmentId, message, pending: () => h.repo.threads.get('chat:t1')!.pending }
   }
-  it('sends to Eval a message that woke a ticket and reached its worker only after a progress report, at a dropped report', () => {
-    const { h, ticketId, assignmentId, note, message, pending } = resumed()
+  it('sends to Eval a message that reached its worker only after a progress report, at a dropped report', () => {
+    const { h, ticketId, assignmentId, message, pending } = followed()
     // Delivering the message fails at first; the worker reports progress, and the retry hands the message over while it
     // writes that nothing is left.
-    h.engine.inputsDelivered(ticketId, assignmentId, [note])
     h.engine.deliveryFailed(ticketId, assignmentId, 'Session busy')
     h.tick(1); h.engine.report(ticketId, { state: 'progress', summary: 'Looking' })
     h.tick(1); h.engine.inputsDelivered(ticketId, assignmentId, [message])
     h.tick(1); h.engine.report(ticketId, { state: 'dropped', summary: 'Nothing to do' })
     expect(pending()).toEqual(['2'])
   })
-  it('counts a message that woke a ticket as read by a later dropped report once its worker\'s Session took it into a step', () => {
-    const { h, ticketId, assignmentId, note, message, pending } = resumed()
+  it('counts a message as read by a later dropped report once its worker\'s Session took it into a step', () => {
+    const { h, ticketId, assignmentId, message, pending } = followed()
     // The Session takes it into the step its arrival starts, before the Executor records the delivery.
     h.engine.inputsRead(ticketId, [message])
-    h.engine.inputsDelivered(ticketId, assignmentId, [note, message])
+    h.engine.inputsDelivered(ticketId, assignmentId, [message])
     h.tick(1); h.engine.report(ticketId, { state: 'progress', summary: 'Looking' })
     h.tick(1); h.engine.report(ticketId, { state: 'dropped', summary: 'Nothing to do' })
     expect(pending()).toEqual([])
   })
-  it('sends to Eval at a merge a message that reached the worker after its last step, which no step took before its turn ended', () => {
+  it('sends to Eval a message that arrives after the ready report ended the ticket', () => {
     const h = harness()
     const ticketId = accepted(h).ticketId!
     h.engine.bindThread(ticketId, { source: 'gh', id: 'pr-9' }, true)
     h.engine.report(ticketId, { state: 'ready', summary: 'PR ready' })
+    expect(h.repo.tickets.get(ticketId)!.ended).toMatchObject({ stop: 'delivered' })
     h.tick(1); h.engine.receive(trigger('2')); h.settle()
-    h.tick(1); h.engine.turnEnded(ticketId, runningAssignment(h.repo.tickets.get(ticketId)!)!.id)
-    h.engine.threadClosed({ source: 'gh', id: 'pr-9' }, 'merged', '2026-09-23T00:00:01Z')
     expect(h.repo.threads.get('chat:t1')!.pending).toEqual(['2'])
+    h.engine.threadClosed({ source: 'gh', id: 'pr-9' }, 'merged', '2026-09-23T00:00:01Z')
+    expect(h.repo.tickets.get(ticketId)!.ended).toMatchObject({ outcome: 'completed' })
   })
   it('counts a message a retry delivered after a failure and a turn end as read by a dropped report only once a step took it', () => {
     for (const taken of [false, true]) {
-      const { h, ticketId, assignmentId, note, message, pending } = resumed()
-      h.engine.inputsDelivered(ticketId, assignmentId, [note])
+      const { h, ticketId, assignmentId, message, pending } = followed()
       h.engine.deliveryFailed(ticketId, assignmentId, 'Session busy')
       h.tick(1); h.engine.turnEnded(ticketId, assignmentId)
       h.tick(1); h.engine.inputsDelivered(ticketId, assignmentId, [message])
@@ -1552,37 +1533,31 @@ describe('what a worker read', () => {
   })
 })
 describe('read claims review', () => {
-  it('gives a retry\'s Assignment the messages the failed one had delivered but no step of its worker took', () => {
+  it('lets a failed report end the ticket and release the message no step took to Eval', () => {
     const h = harness()
     const ticketId = accepted(h).ticketId!
     h.tick(1); h.engine.receive(trigger('2')); h.settle()
     const ticket = () => h.repo.tickets.get(ticketId)!
-    const inputId = ticket().inputs.find(input => input.kind === 'trigger' && input.triggerId === '2')!.id
     expect(ticket().undelivered).toEqual([])
     h.tick(1); h.engine.report(ticketId, { state: 'failed', summary: 'The turn broke.' })
-    h.tick(1); h.engine.retryTicket(ticketId)
-    expect(ticket().undelivered).toEqual([inputId])
+    expect(ticket().ended).toMatchObject({ by: 'executor', stop: 'failed' })
+    // The message its worker never took into a step goes to Eval as new work; there is no retry (C-11, N-13a).
+    expect(h.repo.threads.get('chat:t1')!.pending).toEqual(['2'])
   })
 })
-describe('read claims review: retries', () => {
-  it('gives a retry only what the Assignment it replaces had delivered and no step took, not what an earlier end let go of', () => {
+describe('read claims review: no retry', () => {
+  it('refuses a report on the ended ticket, and leaves the message it let go to Eval', () => {
     const h = harness()
     const ticketId = accepted(h).ticketId!
-    const ticket = () => h.repo.tickets.get(ticketId)!
-    const inputOf = (triggerId: string) => ticket().inputs.find(input => input.kind === 'trigger' && input.triggerId === triggerId)!.id
     // A follow-up reaches the worker, and the ticket ends before any step took it, which sends it to Eval.
     h.tick(1); h.engine.receive(trigger('2')); h.settle()
     h.tick(1); h.engine.report(ticketId, { state: 'dropped', summary: 'nothing to do' })
     expect(h.repo.threads.get('chat:t1')!.pending).toEqual(['2'])
-    // A person's message resumes the ticket; its worker reports blocked before a step took the message, and a person retries.
-    h.tick(1); h.engine.receive(trigger('3')); h.settle()
-    h.tick(1); h.engine.report(ticketId, { state: 'blocked', summary: 'Which page?' })
-    h.tick(1); h.engine.retryTicket(ticketId)
-    expect(ticket().undelivered).toEqual([inputOf('3')])
+    expect(() => h.engine.report(ticketId, { state: 'progress', summary: 'x' })).toThrow(new UserError('ticketEnded'))
   })
 })
 describe('read claims review: restarts', () => {
-  it('gives a restart\'s Assignment what the replaced one had delivered and no step took, and a retry of it gets it again', () => {
+  it('gives a restart\'s Assignment what the replaced one had delivered and no step took', () => {
     const h = harness()
     const ticketId = accepted(h).ticketId!
     const ticket = () => h.repo.tickets.get(ticketId)!
@@ -1592,10 +1567,12 @@ describe('read claims review: restarts', () => {
     h.tick(1); h.engine.assignmentInterrupted(ticketId, runningAssignment(ticket())!.id)
     expect(ticket().undelivered[0]).toBe(inputOf('2'))
     h.settle()
-    // That Assignment blocks before a step took it, and a person retries: the retry's Assignment gets it too.
-    h.tick(1); h.engine.report(ticketId, { state: 'blocked', summary: 'Which page?' })
-    h.tick(1); h.engine.retryTicket(ticketId)
-    expect(ticket().undelivered).toEqual([inputOf('2')])
+    // A question keeps the restarted ticket open at a clean node; the person's adjudication resumes it (C-16a).
+    h.tick(1); h.engine.report(ticketId, { state: 'blocked', summary: 'Which page?', question: 'Which page?' })
+    expect(ticket().attention).toMatchObject({ question: 'Which page?' })
+    h.engine.resumeTicket(ticketId, 'The settings page')
+    expect(ticket()).not.toHaveProperty('attention')
+    expect(ticket().inputs.at(-1)).toMatchObject({ kind: 'text', text: 'The settings page' })
   })
 })
 describe('ignores from the card', () => {

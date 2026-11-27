@@ -8,4 +8,6 @@ export const LIMITS = {
   promptMaxChars: { min: 1000, max: 1_000_000 },
   admissionContextMaxPages: { min: 1, max: 100 },
   admissionContextTimeoutMs: { min: 1, max: 90_000 },
+  /** Stuck-detection threshold in minutes (C-12b): default 60, adjustable. */
+  stuckMinutes: { min: 5, max: 1440 },
 } as const

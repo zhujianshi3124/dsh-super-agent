@@ -45,8 +45,7 @@ export interface TriggerDisposition {
   evalId?: string
   decisionId?: string
   /**
-   * The tickets it reached, by subscription fan-out or attached by the main Session; a ticket that ended or could not resume
-   * without its worker taking it up no longer counts.
+   * The tickets it reached, by subscription fan-out or attached by the main Session; a ticket that ended no longer counts.
    */
   fanout: string[]
   /** The tickets of `fanout` it reached only on a Thread their Executor follows for context, which makes it none of theirs. */
@@ -67,8 +66,8 @@ export interface FollowupRecords {
 }
 /**
  * The tickets whose worker decides a person's follow-up: those it reached on their own Threads that can still decide it
- * and did not hand it back. A ticket can while it is live, also once a person dropped its Subscription to the Thread, and
- * while it is ended, not by a person, with the Trigger waiting to resume it. None once a person sent it to Eval, or while
+ * and did not hand it back. A ticket can while it is live, also once a person dropped its Subscription to the Thread.
+ * An ended ticket decides nothing. None once a person sent it to Eval, or while
  * an Eval holds it, which an earlier version may have queued. While a ticket owns it, the message goes to no Eval, and the
  * main Session may only stop the work on it.
  */
@@ -82,8 +81,7 @@ export function followupOwners(trigger: Pick<Trigger, 'id' | 'human' | 'threads'
   if (!reached.length || records.threads.get(threadKey(trigger.threads[0]!))?.evaluating?.triggerIds.includes(trigger.id)) return []
   return reached.filter(id => {
     const ticket = records.tickets.get(id)
-    return !!ticket && (liveTicket(ticket) || (ticket.ended?.by !== 'human'
-      && ticket.inputs.some(input => input.kind === 'trigger' && input.triggerId === trigger.id && ticket.undelivered.includes(input.id))))
+    return !!ticket && liveTicket(ticket)
   })
 }
 /**
@@ -164,7 +162,7 @@ export interface Thread {
   subscriptions: string[]
   /**
    * The subscribed tickets whose Executor follows the thread for read-only context, such as an Issue or another pull request
-   * it found: its messages reach them, but grant nothing, and a person's message there resumes none of them that ended.
+   * it found: its messages reach live tickets, but grant nothing, and an ended ticket takes none (C-11).
    */
   context?: string[]
   /** Keys of threads that shared a trigger with this one; context only. */
@@ -213,12 +211,14 @@ export type AssignmentState = 'pending' | 'running' | 'ended'
  * What an Assignment reports: work is in progress (`progress`), its worker waits for a Trigger (`waiting`), a result is
  * ready (`ready`), a person must act to unblock or recover it (`blocked` or `failed`), or nothing is left to do (`dropped`).
  */
-export type ReportState = 'progress' | 'waiting' | 'ready' | 'blocked' | 'failed' | 'dropped'
+export type ReportState = 'progress' | 'waiting' | 'ready' | 'blocked' | 'failed' | 'dropped' | 'wrapped'
 /** Binding between a ticket and one executor instance. */
 export interface Assignment {
   id: string
   state: AssignmentState
   createdAt: string
+  /** The worker Session this Assignment ran in; a later generation of the ticket replaces it (C-05, C-29). */
+  sessionId?: string
   startedAt?: string
   endedAt?: string
   endedReason?: string
@@ -248,9 +248,9 @@ export type TicketInput =
     deliveredAt?: string }
   /** The Policy changed in a way that bears on the ticket, as `effect` says; Inputs written before effects have none. */
   | { id: string; kind: 'policy-changed'; from: string; to: string; at: string; effect?: PolicyEffect }
-  /** A Decision reopened the ticket; written before ended tickets resumed on their own. */
+  /** A Decision reopened the ticket; written by earlier versions, before C-11 forbade waking ended tickets. */
   | { id: string; kind: 'reopen'; decisionId: string; at: string }
-  /** A human's message on one of its Threads resumed the ended ticket under its unchanged Mandate. */
+  /** A human's message resumed the ended ticket; written by earlier versions, before C-11 forbade waking ended tickets. */
   | { id: string; kind: 'resumed'; triggerId: string; at: string }
   | { id: string; kind: 'text'; text: string; at: string }
   /** A fact the main Session gave the ticket from other work: context, which asks for nothing and grants nothing. */
@@ -268,11 +268,26 @@ export interface PolicyEffect {
   requester?: ActorRef
 }
 
-export type TicketEndBy = 'executor' | 'human'
-/** How a ticket ended: with its result, with its pull request merged or closed unmerged, with nothing to do, or stopped by a person. */
+export type TicketEndBy = 'executor' | 'human' | 'foreman' | 'system'
+/** Legacy outcomes kept for records written before schema 12; the canonical stop reason is `ended.stop` (N-13). */
 export type TicketOutcome = 'completed' | 'merged' | 'closed' | 'dropped' | 'stopped'
+/**
+ * Why a ticket stopped (N-13): delivered, the person stopped it, the foreman stopped a stuck worker, an emergency stop,
+ * the worker session stopped working (network, rate limit, quota), or the work failed. A stopped ticket stays stopped.
+ */
+export type TicketStopReason = 'delivered' | 'user-stopped' | 'stuck' | 'emergency' | 'session-stopped' | 'wrapped' | 'failed'
+/** The stop reason of an ended ticket; records written before schema 12 map their legacy outcome onto one. */
+export function ticketStop(ticket: Pick<Ticket, 'ended'>): TicketStopReason | undefined {
+  const ended = ticket.ended
+  if (!ended) return undefined
+  if (ended.stop) return ended.stop
+  if (ended.outcome === 'stopped') return ended.by === 'human' ? 'user-stopped' : 'failed'
+  return 'delivered'
+}
 /** A question for a person; `triggerId` is the human message that raised it, whose conversation it goes back to. */
-export interface Attention { id: string; question: string; triggerId?: string }
+export interface Attention { id: string; question: string; triggerId?: string;
+  /** Which C-15 situation the question is (item number 2-7), so the panel can label what the person is waited for (C-37.1). */
+  kind?: number }
 /** Ticket aggregate: an authorized work item with its assignments, channels, thread bindings, and inputs. */
 export interface Ticket {
   id: string
@@ -282,7 +297,7 @@ export interface Ticket {
   /** The Channels of the messages it was accepted from, which its replies go to. */
   channels: ChannelRef[]
   /** When, by whom, and how the ticket ended, with a person's or the host's reason beyond the outcome; an open ticket has none. */
-  ended?: { at: string; by: TicketEndBy; outcome: TicketOutcome; reason?: string }
+  ended?: { at: string; by: TicketEndBy; outcome: TicketOutcome; stop?: TicketStopReason; reason?: string }
   /** Open question for a person; cleared by the executor or when the ticket ends. */
   attention?: Attention
   assignments: Assignment[]
@@ -305,6 +320,19 @@ export interface Ticket {
   execution?: Execution
   /** The latest failed delivery of an Input to its worker, until a delivery succeeds. */
   delivery?: { error: string; at: string }
+  /** What the foreman decided about this ticket, oldest first: a successor reads them instead of deciding or asking again (C-30). */
+  decisions?: { at: string; text: string }[]
+  /** The confirmed instruction this ticket was created under, and the task number within it (C-22, C-29). */
+  proposal?: string
+  task?: number
+  /** The stopped ticket whose task this one continues (N-13a); the continuation is a new ticket, never a reopened one. */
+  continues?: string
+  /** Completion criteria copied from the instruction, at most 8 (N-08, C-13a); absent when none could be written clearly. */
+  criteria?: string[]
+  /** The worker session the person named that this ticket waits for while it finishes another ticket (C-12); absent once dispatched. */
+  waitingFor?: string
+  /** The foreman judged this task small enough for a named session between 35% and 40% (C-12a): estimated usage at most 5%. */
+  smallTask?: boolean
 }
 /**
  * A Thread a ticket follows, by its key: `own` when the ticket opened it, such as its own pull request, and when and how it
@@ -312,7 +340,10 @@ export interface Ticket {
  * Thread closed; the ticket then ends unless its work has not finished (see `Tickets.unfinished`).
  */
 export interface Follow { thread: string; own: boolean; closed?: { at: string; outcome: 'merged' | 'closed' } }
-export interface Execution { name: string; directory: string; assignment: string }
+/** What a ticket's Executor chose: its short name, the directory it works in, the assignment text, and the workspace the person named. */
+export interface Execution { name: string; directory: string; assignment: string
+  /** The directory the person named as the ticket's workspace, absent when the default worker workspace applies (N-10). */
+  workspace?: string }
 
 /** Whether a ticket is open: it has not ended. */
 export const liveTicket = (ticket: Pick<Ticket, 'ended'>): boolean => !ticket.ended
@@ -343,11 +374,34 @@ export function readUntil(ticket: Pick<Ticket, 'assignments'>, progress = true):
   return [report?.at ?? '', ...ticket.assignments.map(assignment => assignment.idleAt ?? '')].reduce((a, b) => a > b ? a : b)
 }
 /**
- * Whether a ticket waits for a person: its latest Assignment reported blocked or failed, and no person's message reached it
- * since. A later report that is neither, a person's message, or a retry, which starts a new Assignment, lifts it.
+ * Whether a ticket waits for the person's adjudication: its worker asked a question and stopped at a clean node (C-16a).
+ * The ticket stays open, its session counts as idle, and it is not judged stuck while it waits.
  */
-export function waitsForPerson(ticket: Ticket): boolean {
-  const report = latestAssignment(ticket)?.report
-  if (report?.state !== 'blocked' && report?.state !== 'failed') return false
-  return !ticket.inputs.some(input => input.kind === 'trigger' && input.human && !input.context && input.at > report.at)
+export function awaitingAdjudication(ticket: Pick<Ticket, 'attention'>): boolean {
+  return !!ticket.attention
+}
+
+/** One task of a Proposal: what to do, its completion criteria when they can be written clearly (C-13a), the directory to
+ * work in (empty means the default), and the worker session the person named for it (C-12), if any. */
+export interface ProposalTask { title: string; request: string; accept?: string; workspace?: string; session?: string }
+/** Where a Proposal came from: the main Session's thread and the message it was read from. */
+export interface ProposalOrigin { source: string; thread: string; messageId?: string; at?: string }
+/**
+ * A numbered instruction: what the person confirmed before any ticket may be created from it. Its `tasks` are the final
+ * wording the person approved; `heard` is the person's own message, kept for cross-checking only and never executed as the
+ * task text. `draft` until the person confirms, `approved` then, and `dispatched` once a ticket was created under it.
+ */
+export interface Proposal {
+  id: string
+  status: 'draft' | 'approved' | 'dispatched'
+  tasks: ProposalTask[]
+  heard: string
+  origin?: ProposalOrigin
+  createdAt: string
+  approvedAt?: string
+  /** When the approved instruction was handed to the foreman session; the delivery itself is idempotent per instruction. */
+  handoffAt?: string
+  dispatchedAt?: string
+  /** Tickets created under this instruction, oldest first; sub-tickets a foreman splits off all belong to it. */
+  ticketIds: string[]
 }

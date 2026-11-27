@@ -11,10 +11,11 @@ export async function resolveRoleModel(ctx: Context, model: RoleModel): Promise<
   return { provider: value.provider, model: value.model, ...(value.reasoningEffort ? { reasoningEffort: value.reasoningEffort } : {}) }
 }
 
-/** Seed a role's configured model onto a brand-new session before its first request, leaving later manual or durable selections intact. */
-export async function initializeRoleModel(ctx: Context, agent: Agent, model: RoleModel | null): Promise<void> {
+/** Seed a role's configured model onto a brand-new session before its first request, leaving later manual or durable selections intact.
+ * `force` writes the selection even over one the session already carries: the one-time inheritance write C-13c requires on adoption. */
+export async function initializeRoleModel(ctx: Context, agent: Agent, model: RoleModel | null, force = false): Promise<void> {
   if (!model) return
-  if (agent.session.requestHeader() || agent.session.snapshotEvents().some(event => event.type === 'model/selection')) return
+  if (!force && (agent.session.requestHeader() || agent.session.snapshotEvents().some(event => event.type === 'model/selection'))) return
   const selected = await resolveRoleModel(ctx, model)
   // Avoid selectModel because it mutates the global DSH default; inject the selection for the initial request only.
   agent.session.append('model/selection', selected)

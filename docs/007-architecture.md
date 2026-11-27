@@ -30,7 +30,7 @@ flowchart TB
 
 `Runtime` is the composition root; it contains no domain rules. Its constructor locks the state directory, opens the Store and builds each component. If construction fails, it closes the Store and releases the lock.
 
-Startup registers management routes and runs Setup. After setup resolves, it installs Session and Executor hooks, ensures the main Session exists, starts Policy syncs, resumes interrupted Assignments, and starts passes and effects. `ready` marks completion of startup.
+Startup registers management routes and runs Setup. After setup resolves, it installs Session and Executor hooks, decorates the main Session the person already opened in its own workspace (`masterWorkspace`, `D:/chief` by default) and creates none, starts Policy syncs, resumes interrupted Assignments, and starts passes and effects. `ready` marks completion of startup.
 
 Shutdown cancels turns, waits for passes, effects and agents, restores the process environment, closes the Store and releases the lock. Source plugins inject Runtime as the `orchestrator` service through the narrow `SourceHost` interface.
 
@@ -234,6 +234,8 @@ Validation inherits an omitted base from the saved override, drops removed parts
 
 `Sessions` (`src/app/sessions.ts`) manages DeepSeek Harness Sessions for both roles. `ensure` creates a Session with its role's model. `install` follows agent events and registers prompts, skills and tools for managed Sessions.
 
+A Session's current directory is its workspace's path, and DSH's registry keeps one workspace per path, so `ensure` creates every worker Session in the execution root (`workspaceOf`): one workspace serves all tickets, and its parent directories do not fill the person's sidebar. Each ticket still works in its own directory under that root, which reaches the worker as `DSH_SUPERAGENT_DIR`, and the worker prompt says to change nothing outside it. The main and foreman Sessions keep the directory they are given.
+
 `prompt` delivers once per request id. `relay` and `notify` enqueue main-Session messages handled by the `relay` and `notice` effects. `src/app/notices.ts` defines their content; `delivery` checks whether a message arrived.
 
 Each model request binds the Session to the current prompt revision. The revisions it used are stored durably: `promptVersion` identifies the active one and `mayRead` restricts which versions a worker can inspect. Registrations are tracked in one map per agent.
@@ -322,6 +324,7 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/app/store-read.ts` | `storeReads`: the Store's read queries for the views, the tools and the Sources' polls, which never write |
 | `src/app/migration.ts` | The schema 11 migration: one step from schema 10 that writes every stored record in its current shape |
 | `src/app/effects.ts` | Effects |
+| `src/app/budget.ts` | `Budget`: the person's limits on managed work (tickets an hour, minutes per assignment, model tokens a day), the local-day token record they are counted by, and `localDay` and `tokensOf` |
 | `src/app/versions.ts` | `Versions`: a record kept as numbered snapshots with a pointer to the current one, for the settings and the prompts |
 | `src/app/cache.ts` | `TextCache`: texts kept in memory within a size, the least recently used dropped first |
 | `src/app/settings.ts` | Settings |
@@ -330,8 +333,14 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/app/context.ts` | The built-in prompt text, read from `prompts/`, and the transcript entries Sessions read |
 | `src/app/skill-files.ts` | Packaged text: `promptFile`, which joins a file's one-sentence lines into paragraphs, and the bundled skills |
 | `src/app/sessions.ts` | Sessions |
+| `src/app/hooks.ts` | `SuperAgentHooks`: the extension event bus and the read-only host views plugins receive |
+| `src/app/extensions.ts` | `ExtensionLoader`: hot load, reload and unload of extension plugin fibers |
+| `src/app/rotation.ts` | `Rotation`: the host-owned swap of a worker or foreman Session for a successor when a plugin reports its real context usage has reached the threshold; the main slot instead asks the person for a Session, which `adopt` then swaps in |
+| `src/app/proposals.ts` | `Proposals`: numbered instructions a person confirms before tickets may be created under them, their `draft`/`approved`/`dispatched` states, and the gate switch `executor.foreman.enabled` |
+| `src/app/chief-source.ts` | `ChiefSource`: the messages the person writes in the main Session they opened as Triggers of the built-in chief Source, and `ensureChiefPolicy`, the Policy part that admits them |
 | `src/app/delivery.ts` | `AgentDelivery`: delivers a message to a DeepSeek Harness agent once per request id, also across a restored Session |
 | `src/app/retry-health.ts` | `RetryHealth`: which Sessions wait on a model budget retry, for the `models` health entry |
+| `src/app/fallback.ts` | `TurnFallback`: a managed Session's turn that ended in a provider error — the person is told through the effect queue, and an approved instruction that reached no ticket is handed to the foreman once more |
 | `src/app/role-models.ts` | Resolves the Eval and Executor models, and seeds a new Session with its role's model |
 | `src/app/assessment.ts` | The MasterAssessor, the assessment schema and the window `orchestrator_eval` answers |
 | `src/app/execution-environment.ts` | The execution environment: its variables, a Ticket's values, the directory root and the lines of the prompt section, which `src/app/prompts.ts` fills into its template |
@@ -361,6 +370,7 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/sources/kind.ts` | The `SourceKind` protocol |
 | `src/sources/registry.ts` | `SourceRegistry` |
 | `src/sources/host.ts` | `SourceHost`, `SourceContext`, `Health`, `health` and the fixed health texts |
+| `src/sources/chief.ts` | The chief Source kind: the Trigger id of a message in the main Session (`chiefTriggerId`), the person it is attributed to, and its Policy part |
 | `src/sources/poll.ts` | What GitHub and Feishu polling share: `POLL_HORIZON_MS`, `polled`, `cursorAt`, and `pollThreads`, which keeps a failure on its Thread as `pollError` |
 | `src/sources/github.ts` | The GitHub kind and plugin entry, exported as `./github-watch`: a poll round of notifications, the pull requests of open Tickets with their CI, and subscribed Threads |
 | `src/sources/github-trigger.ts` | GitHub comments, reviews, Issue bodies and CI changes as Triggers, and GitHub addresses |
@@ -436,6 +446,17 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `tests/cards.spec.ts` | The rules the built-in text must state, file by file |
 | `tests/model-surface.spec.ts` | Everything models read: tools, prompts, skills and inputs, checked against the tool schemas, the execution environment and the glossary, within a size budget per role |
 | `tests/deployment.spec.ts`, `tests/environment.spec.ts`, `tests/index.spec.ts` | The plugin configuration and setup, the agent's process environment, the plugin entry |
+| `tests/master-workspace.spec.ts` | The main Session's own workspace, and the move of the main slot into it |
+| `tests/turn-fallback.spec.ts` | A foreman turn that ended in a provider error: the notice the main Session gets, the one redelivery, and the stop after it |
+| `tests/foreman.spec.ts`, `tests/foreman-switch.spec.ts` | The foreman slot, its instruction text and handoff, and the settings switch that turns it on |
+| `tests/stuck.spec.ts` | `StuckWatch`: the dual signal of model action and context growth, one report per episode, the grace, the adjudication exemption, idle sessions, and the live threshold |
+| `tests/foreman-mechanisms.spec.ts` | The foreman mechanisms on a running host: the stuck stop, the emergency stop, the named-session wait's three decisions, one live ticket per task and its continuation, the foreman replacement, and the adjudication relay |
+| `tests/worker-continuation.spec.ts` | A worker that stops before its ticket is done goes on (C-13b, C-13e): the successor at the context threshold starts at once with no message and tells nobody; a ticket stopped halfway is continued with the fixed sentence (in the successor when a rotation waits) or ended failed, each recorded; tickets that still work or wait for the person are refused |
+| `tests/proposals.spec.ts` | Numbered instructions: drafting, who may confirm, and the gate that refuses Tickets without an approved one |
+| `tests/chief-source.spec.ts` | A message in the main Session as a Trigger: the instruction the person confirms, the ticket the foreman opens under it with that Trigger, its worker, and the report back to the main Session |
+| `tests/worker-workspace.spec.ts` | Where a worker Session lands: the one workspace of the execution root rather than one per ticket, the ticket's own directory under it that the environment names, and the worker prompt's rule to change nothing outside it |
+| `tests/budget.spec.ts` | The person's budget: how a model step is counted, the local day's record, each limit's refusal, and where a tripped limit acts — a refused accept, a held launch, and a running assignment stopped as a blocked report |
+| `tests/panel-deployment.spec.tsx`, `tests/panel-source.spec.tsx`, `tests/panel-eval.spec.tsx`, `tests/panel-execution.spec.tsx`, `tests/panel-prompts.spec.tsx`, `tests/panel-trigger.spec.tsx`, `tests/panel-panel.spec.tsx` | The panel pages, each rendered against its view data |
 | `tests/service-script.spec.ts` | `scripts/dsh-superagent` against fake `ps`, `tmux` and `dsh` |
 | `tests/client.spec.tsx`, `tests/navigation.spec.ts`, `tests/controls.spec.tsx` | The client plugin's registration and polling, Session navigation and route memory, the local controls, and the panel's imports, which have no cycle |
 | `tests/panel-overview.spec.tsx`, `panel-source.spec.tsx`, `panel-trigger.spec.tsx`, `panel-eval.spec.tsx`, `panel-execution.spec.tsx` | Each page of the panel, against a fake management API answered by route |
@@ -531,6 +552,8 @@ A hand-back returns `queued: false` if another Ticket still owns the message, or
 
 The worker preset is defined in `cordis.patch.yml` and selected through `WORKER_PRESET`. `WORK_TOOLS` in `src/app/sessions.ts` retains available file, search, shell, job, web, skill, todo and subagent tools. Workers do not receive tools for asking or presenting to a person, changing the profile, scheduling work outside worker slots, starting or messaging other Sessions, or editing external documents. Tool calls are refused after the Ticket ends.
 
+The main Session's own tools come from `MAIN_TOOLS` in `src/app/sessions.ts`: skills, reading and a shell with its jobs. The foreman's come from `FOREMAN_TOOLS`: skills, reading and images only, with no shell, no write tool and no job control. An instruction therefore cannot be carried out in the foreman's own turn — the roles stay apart even when a model would rather do the work itself — and a task is done only when a ticket's worker reports it.
+
 ### Result shapes and assessment context
 
 Routing results use `{decision?, reason, ticket?}`. `orchestrator_route` returns `{results}`, preserving item order and adding each item's `trigger_id` and `kind`. Invalid or refused items return `refused` and a reason without stopping the batch.
@@ -603,7 +626,7 @@ Most built-in instructions live in `prompts/*.md`, with one sentence per line jo
 
 ## Configuration reload
 
-Every plugin configuration key except `stateDir` is volatile. The panel's Deployment settings and DeepSeek Harness's Plugin Manager edit them through DeepSeek Harness's configuration form; the host writes `cordis.patch.yml` and updates the values in place, and dsh-superagent reads each limit when it uses it, so a change applies without a restart.
+Every plugin configuration key except `stateDir` and `masterWorkspace` is volatile. The panel's Deployment settings and DeepSeek Harness's Plugin Manager edit them through DeepSeek Harness's configuration form; the host writes `cordis.patch.yml` and updates the values in place, and dsh-superagent reads each limit when it uses it, so a change applies without a restart.
 
 A settings save that changes a Source field setup reads, such as an account's CLI, and any save while setup waits, restarts dsh-superagent. DeepSeek Harness's settings service does not serve the entry during that restart, so after its own restart dsh-superagent asks it to read the entry again, and an open form becomes editable again.
 

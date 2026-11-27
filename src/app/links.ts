@@ -66,6 +66,9 @@ export async function candidateCard(host: LinkHost, candidate: Candidate) {
     mode: settings.eval.mode, ...others.length ? { batch: others.map(trigger => triggerCard(trigger)) } : {},
     ...handedBack.length ? { handed_back: handedBack } : {}, ...relatedTickets(candidate.tickets),
     ...(delivered.length ? { delivered_to: delivered } : {}), ...(referenced.length ? { referenced_tickets: referenced.map(ticketCard) } : {}),
-    next_action: candidate.strength === 'explicit' ? 'Route it with orchestrator_route as dispatch says: accept, attach, stop or ignore.'
-      : 'Ignore it with orchestrator_route if the card shows it touches no enabled rule; else assess it with orchestrator_eval, orchestrator_eval_read, then orchestrator_eval_decide.' }
+    // The main Session drafts a numbered instruction and hands it over; only ignore stays its own, and no attach: an attach
+    // would put a new request into a ticket whose directory and model are already fixed.
+    next_action: candidate.strength === 'explicit'
+      ? 'Draft an instruction with orchestrator_proposal; hand it over once the person confirms.'
+      : 'No ticket without the person\'s request: draft an instruction with orchestrator_proposal if they ask for this work, or ignore it from its card.' }
 }

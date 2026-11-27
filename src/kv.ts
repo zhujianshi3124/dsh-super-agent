@@ -18,6 +18,20 @@ export function family<V, A extends unknown[] = [string]>(prefix: string, format
   return Object.assign((...name: A) => `${prefix}${format(...name)}` as Key<V>, { prefix })
 }
 
+/** A rotation request a plugin filed through `hooks.requestRotation`, kept until the host fulfils it. */
+export interface RotationRequest { reason: string; summary?: string; handoffPath?: string; requestedBy: string; at: string }
+/** Which Session currently fills a logical slot, its generation, the Sessions it succeeded, and any pending rotation. */
+export interface RotationState { current: string; generation: number; previous: string[]; pending?: RotationRequest
+  /** The last context ratio a plugin reported for this slot, which the panel shows as how full the session is. */
+  usage?: { ratio: number; at: string }
+  /** When this slot last changed hands, which the panel shows as the latest rotation. */
+  rotatedAt?: string }
+/** One startup adoption attempt per role slot: the Session it picked, whether it could be opened, and whether it was adopted. */
+export interface RotationAdoption { at: string
+  master?: { id: string; opened: boolean; adopted: boolean }
+  foreman?: { id: string; opened: boolean; adopted: boolean }
+  error?: string }
+
 export const KV = {
   /** Store: current database schema version. */
   store: { schema: record<number>('schema') },
@@ -31,8 +45,20 @@ export const KV = {
     builtIn: family<string, [base: string]>('prompt-built-in:') },
   /** Runtime: the main Session's ID. */
   runtime: { masterId: record<string>('master-id') },
+  /**
+   * Rotation: the current Session of each logical slot (a ticket's worker, or the main Session) and its generation,
+   * the earlier Sessions it succeeded, and a pending rotation request the host fulfils when the current task ends.
+   */
+  rotation: { worker: family<RotationState, [ticket: string]>('rotation-worker:'), master: record<RotationState>('rotation-master'),
+    foreman: record<RotationState>('rotation-foreman'),
+    /** What the last startup adoption attempt did, kept so a silent refusal can be read back from the database instead of from a log line nobody sees. */
+    adopt: record<RotationAdoption>('rotation-adopt') },
   /** Sessions: prompt revisions each Session has worked under, ordered oldest first; the last entry (`.at(-1)`) is its active revision. */
   sessions: { prompts: family<number[], [session: string]>('session-prompts:') },
+  /** Wrap-up (C-17b): whether the person wrapped up and since when, kept across a shutdown, and the recent wrap-ups and starts of work. */
+  wrapUp: { state: record<{ since: string }>('wrapup-state'), history: record<{ kind: 'wrap-up' | 'start-work'; at: string }[]>('wrapup-history') },
+  /** Proposals: the last numbered instruction issued, so ids (`pr-1`, `pr-2`) never repeat. */
+  proposals: { seq: record<number>('proposal-seq') },
   /** Schema 11 migration: legacy main-Session queues imported into the effect table. */
   queues: { relays: record<{ id: string; text: string }[]>('relay-queue'), unsubscribed: record<string[]>('subscription-results'),
     prompts: record<number | null>('prompt-notification'), settings: record<number | null>('settings-notification') },

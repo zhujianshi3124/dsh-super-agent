@@ -240,13 +240,14 @@ const opened = (records: Record<string, unknown>) => {
   return new Store(path)
 }
 
-it('writes a prompt version saved before the team sections in them, keeping its skills and auto-merge threshold, and marks it', () => {
+it('writes a prompt version saved before the team sections in them, keeping its skills, and marks it', () => {
   const store = opened({ ...legacyPrompts(3, { notes: 'Call orchestrator_create_task with event_id, read event/<id>, follow guide/work and guide/release, load dsh-tag-github, cd "$DSH_TAG_DIR".' }) })
   const prompts = new Prompts(store, () => 100000, () => undefined, () => true)
   const { config } = prompts.version(3)
   expect(config.communication).toBe(defaultPrompts().communication)
-  expect(config.delivery).toContain('it changes fewer than 350 lines (additions plus deletions);')
-  expect(config.delivery).not.toContain('fewer than 200 lines')
+  // The v2.32 delivery default carries no auto-merge wording; a legacy guide's threshold no longer anchors into it.
+  expect(config.delivery).toBe(defaultPrompts().delivery)
+  expect(config.delivery.toLowerCase()).not.toContain('auto-merge')
   // Guides that are now fixed or built-in are gone; the team's own skills stay, in current names.
   expect(Object.keys(config.skills)).toEqual(['identities', 'notes'])
   expect(config.skills.notes).toBe('Call orchestrator_route (kind accept) with trigger_id, read trigger/<id>, follow the work section and skill dsh-superagent-release, load dsh-superagent-github, cd "$DSH_SUPERAGENT_DIR".')
@@ -278,7 +279,7 @@ it('writes the removed auto-merge threshold and member identities into the promp
   const prompts = new Prompts(store, () => 100000, () => undefined, () => true)
   const migrated = prompts.current()
   expect(migrated).toMatchObject({ revision: 1, previousRevision: 0, source: 'settings-migration' })
-  expect(migrated.config.delivery).toContain('it changes fewer than 350 lines (additions plus deletions);')
+  expect(migrated.config.delivery).toContain('Enable auto-merge only on a PR that changes fewer than 350 lines (additions plus deletions).')
   expect(migrated.config.skills.identities).toContain('- Alice (Feishu ou_alice) is @alice on GitHub')
   expect(migrated.config.skills.identities).not.toContain('Bob')
   expect(store.get('settings-before-9')).toBeUndefined()

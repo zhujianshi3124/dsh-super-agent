@@ -1,5 +1,5 @@
 /** Built-in prompt sections, role policies, and transcript projections for orchestrator and worker Sessions. */
-import { bundledSkills, promptFile } from './skill-files.ts'
+import { promptFile } from './skill-files.ts'
 import type { SessionEvent } from '@deepseek-ai/dsh-session'
 export { textPage } from './cards.ts'
 
@@ -7,18 +7,15 @@ export { textPage } from './cards.ts'
 export const sharedPrompt = promptFile('shared')
 export const masterPrompt = promptFile('orchestrator')
 export const workerPrompt = promptFile('worker')
+/** Built-in instructions of the foreman session: plan, dispatch and report, never asking the person to confirm twice. */
+export const foremanPrompt = promptFile('foreman')
 /** Built-in policy sections referenced by role prompts; a team may override them. */
-export const guides: Readonly<Record<string, string>> = Object.fromEntries(['subscriptions', 'replies', 'dispatch', 'work']
+export const guides: Readonly<Record<string, string>> = Object.fromEntries(['inputs', 'reporting', 'dispatch', 'work']
   .map(name => [name, promptFile(name)]))
-/** Bundled Source skills registered by dsh-superagent; a team may override their text. */
-export const sourceSkills: Readonly<Record<'feishu' | 'github', string>> = { feishu: bundledSkills.feishu.content, github: bundledSkills.github.content }
-export const cliNotes = promptFile('cli')
-/** Default text for the team-editable prompt sections (communication, ticket scope, and PR delivery). */
+/** Default text for the team-editable prompt sections (communication, ticket scope, and delivery). */
 export const teamDefaults = {
   communication: promptFile('team/communication'), scope: promptFile('team/scope'), delivery: promptFile('team/delivery'),
 }
-
-export const mainAdmissionPolicy = promptFile('admission')
 
 const handoff = { shared: promptFile('handoff'), orchestrator: promptFile('handoff-orchestrator'), worker: promptFile('handoff-worker') }
 export const handoffPolicy = (role: 'orchestrator' | 'worker'): string => `${handoff.shared}\n${handoff[role]}`

@@ -1,5 +1,5 @@
 /** In-memory repository implementation for testing and ephemeral engine instances. */
-import { latestAssignment, type Decision, type Thread, type Ticket, type Trigger, type TriggerDisposition } from './model.ts'
+import { latestAssignment, type Decision, type Proposal, type Thread, type Ticket, type Trigger, type TriggerDisposition } from './model.ts'
 import type { Repositories } from './ports.ts'
 
 const clone = <T>(value: T): T => structuredClone(value)
@@ -13,8 +13,9 @@ export class MemoryRepositories implements Repositories {
   private readonly threadRows = new Map<string, Thread>()
   private readonly ticketRows = new Map<string, Ticket>()
   private readonly decisionRows = new Map<string, Decision>()
+  private readonly proposalRows = new Map<string, Proposal>()
   atomic<T>(work: () => T): T {
-    const maps: Map<string, unknown>[] = [this.triggerRows, this.dispositions, this.threadRows, this.ticketRows, this.decisionRows]
+    const maps: Map<string, unknown>[] = [this.triggerRows, this.dispositions, this.threadRows, this.ticketRows, this.decisionRows, this.proposalRows]
     const snapshot = maps.map(map => new Map(map))
     try { return work() }
     catch (error) {
@@ -46,5 +47,11 @@ export class MemoryRepositories implements Repositories {
     get: (id: string) => clone(this.decisionRows.get(id)),
     save: (decision: Decision) => { this.decisionRows.set(decision.id, clone(decision)) },
     byThread: (key: string) => [...this.decisionRows.values()].filter(decision => decision.threadKey === key).map(clone),
+  }
+  readonly proposals = {
+    get: (id: string) => clone(this.proposalRows.get(id)),
+    save: (proposal: Proposal) => { this.proposalRows.set(proposal.id, clone(proposal)) },
+    /** Newest first, matching the SQLite Store's order. */
+    list: () => [...this.proposalRows.values()].reverse().map(clone),
   }
 }

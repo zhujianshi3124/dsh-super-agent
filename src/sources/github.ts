@@ -25,7 +25,8 @@ const NotificationSchema = z.looseObject({
 const GithubConfigSchema = GithubAccountsSchema.extend({ pollSeconds: z.number().int().min(60).max(3600).default(60),
   failuresBeforeError: z.number().int().min(1).max(20).default(3),
   observeIssues: z.boolean().default(false), observePulls: z.boolean().default(false), observeComments: z.boolean().default(false),
-  observeCi: z.boolean().default(false) }).strict()
+  observeCi: z.boolean().default(false),
+  skipNotifications: z.boolean().default(false), allowSelfAuthored: z.boolean().default(false) }).strict()
 export type GithubConfig = z.infer<typeof GithubConfigSchema>
 const OBSERVED = { issues: 'observeIssues', pulls: 'observePulls', comments: 'observeComments', ci: 'observeCi' } as const
 type Scope = keyof typeof OBSERVED
@@ -219,12 +220,16 @@ async function readStream(ctx: SourceContext, round: Round, id: string, path: st
   const { headers, body } = included(raw)
   const items = validItems(ListedSchema, z.array(z.unknown()).parse(JSON.parse(body)), round.tally)
   const { login } = ctx.deployment.github
+  const selfAuthored = ctx.config<GithubConfig>(SOURCE)?.allowSelfAuthored === true
   const fresh = (at: string | null | undefined, kind: string) =>
     kind in started && Date.parse(at ?? '') >= Math.max(Date.parse(started[kind]!), horizon)
   for (const item of items) {
     // Stopping mid-stream aborts before advancing the cursor so unread items are retried.
     if (stopped(ctx, round)) throw new Error('The GitHub Source stopped during the poll')
-    if (sameName(item.user.login, login)) continue
+    if (sameName(item.user.login, login)) {
+      const body = typeof (item as { body?: unknown }).body === "string" ? (item as { body: string }).body : ""
+      if (!selfAuthored || !body.includes(`@${login}`)) continue
+    }
     if (id === 'issues') {
       const issue = IssueSchema.safeParse(item)
       const pr = issue.success && !!issue.data.pull_request
@@ -279,7 +284,10 @@ async function pollBranchCi(ctx: SourceContext, round: Round): Promise<void> {
  */
 export async function pollRound(ctx: SourceContext, signal?: AbortSignal): Promise<number> {
   const round = newRound(signal)
-  const notified = await pollNotifications(ctx, round).then(value => ({ value }), (error: unknown) => ({ error }))
+  const config = ctx.config<GithubConfig>(SOURCE)
+  const notified = config?.skipNotifications
+    ? { value: { count: 0, interval: Math.max(60, config.pollSeconds) } }
+    : await pollNotifications(ctx, round).then(value => ({ value }), (error: unknown) => ({ error }))
   await pollRepository(ctx, round)
   await pollTicketPulls(ctx, signal, round)
   await pollThreads(ctx, signal, round)

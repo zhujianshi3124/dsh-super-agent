@@ -73,7 +73,7 @@ export const threadFollowedNotice = (ticketId: string, thread: string, reason: s
     note: 'For context only: its messages reach this ticket and grant nothing.' },
     `Ticket ${ticketId} follows thread ${thread} for context: ${reason}`)
 
-/** Steering relay payload for the main Session: `id` is the request ID that makes delivery idempotent, and `text` is the message body. */
+/** Steering relay payload for the main Session or the foreman: `id` is the request ID that makes delivery idempotent, and `text` is the message body. */
 export interface Relay { id: string; text: string }
 /** What a follow-up asks of the main Session: nothing but a stop the person asks for, since its ticket's worker decides it. */
 const FOLLOWUP_NOTE = 'Its ticket\'s worker has it and decides; act only if the person asks to stop the work '
@@ -104,7 +104,7 @@ export function followupRelay(message: { trigger_id: string },
   return { id: `followup:${message.trigger_id}`, text: JSON.stringify({ kind: 'follow_up', ...message, delivered_to: tickets,
     note: FOLLOWUP_NOTE }) }
 }
-/** Formats a worker report relay for the main Session (truncating summaries over 600 characters behind `ticket/<id>/result`); `replyTo` names the human question trigger it answers. */
+/** Formats a worker report relay for the foreman that dispatched the ticket (truncating summaries over 600 characters behind `ticket/<id>/result`); `replyTo` names the human question trigger it answers. */
 export function resultRelay(ticket: Ticket, state: string, text: string, replyTo?: string): Relay {
   const id = key('worker-result', ticket.id, ticket.updatedAt, text)
   const summary = text.length > 600 ? { summary: text.slice(0, 600), chars: text.length } : { summary: text }
@@ -113,16 +113,16 @@ export function resultRelay(ticket: Ticket, state: string, text: string, replyTo
   return { id: `report:${id}`, text: JSON.stringify(report) }
 }
 /**
- * Converts a worker report recorded on `ticket` into a main-Session relay: a question for a person produces a
+ * Converts a worker report recorded on `ticket` into a relay for the foreman: a question for a person produces a
  * `worker_attention` relay, and a result, blocker, end, or answer to a question produces a `worker_report` relay, while
- * routine `progress` reports without `answers` stay internal.
- * @returns The steering `Relay`, or `undefined` when the report is not relayed to the main Session.
+ * routine `progress` reports without `answers` stay internal. A worker reports to the foreman, never above it (C-16a).
+ * @returns The steering `Relay`, or `undefined` when the report is not relayed.
  */
 export function reportRelay(ticket: Ticket, report: Pick<WorkerReport, 'state' | 'summary' | 'question' | 'answers'>): Relay | undefined {
   const asked = report.question ? ticket.attention : undefined
   if (asked) {
     return { id: `attention:${ticket.id}:${asked.id}`,
-      text: JSON.stringify({ kind: 'worker_attention', ticket: brief(ticket), state: report.state, read: `ticket/${ticket.id}/result` }) }
+      text: JSON.stringify({ kind: 'worker_attention', ticket: brief(ticket), state: report.state, ...(asked.kind ? { c15_kind: asked.kind } : {}), read: `ticket/${ticket.id}/result` }) }
   }
   if (report.state === 'progress' && !report.answers) return undefined
   return resultRelay(ticket, report.state, report.summary, report.answers)

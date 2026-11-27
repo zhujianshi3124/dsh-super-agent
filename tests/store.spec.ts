@@ -13,7 +13,7 @@ import { SettingsSchema } from '../src/policy.ts'
 
 let directory: string
 beforeEach(() => { directory = mkdtempSync(join(tmpdir(), 'orchestrator-store-')) })
-afterEach(() => { rmSync(directory, { recursive: true, force: true }) })
+afterEach(() => { rmSync(directory, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 }) })
 
 it('refuses databases newer than this build and rolls back failed atomic work', () => {
   const path = join(directory, 'orchestrator.sqlite')
@@ -260,5 +260,22 @@ it('reads `%` and `_` in a key prefix and a search query as written, not as patt
     human: true, at: '2026-10-01T00:00:00.000Z', text, meta: {} })
   for (const [id, text] of [['p', 'grew 50% today'], ['q', 'grew 500 today'], ['r', 'see a_b'], ['s', 'see axb']]) store.triggers.save(said(id!, text!))
   expect([store.read.search('50%').map(item => item.id), store.read.search('a_b').map(item => item.id)]).toEqual([['p'], ['r']])
+  store.close()
+})
+
+it('opens settings an earlier version wrote with the dropped foreman block, and saves the current shape', () => {
+  const store = new Store(join(directory, 'orchestrator.sqlite'))
+  // A record exactly as an earlier version of this installation wrote it: the foreman block it has since removed (N-02).
+  store.set(KV.settings.version(1), { revision: 1, previousRevision: null, savedAt: '2026-11-18T15:22:49.227Z',
+    source: 'panel', block: 'executor', policyVersion: '', policyChanged: false, notified: [],
+    settings: { executor: { foreman: { enabled: true, workspace: '' } } } } as never)
+  store.set(KV.settings.revision, 1)
+  // Reading it does not fail, and the whole dropped block is gone from what this version sees.
+  expect(store.settings().executor).not.toHaveProperty('foreman')
+  // A save keeps working, and the stored shape no longer carries the block.
+  const saved = store.saveSettings({ ...store.settings(), executor: { ...store.settings().executor, maxWorkers: 2 } })
+  expect(saved.executor.maxWorkers).toBe(2)
+  const second = store.get<{ settings: { executor: Record<string, unknown> } }>(KV.settings.version(2))!
+  expect(second.settings.executor).not.toHaveProperty('foreman')
   store.close()
 })
