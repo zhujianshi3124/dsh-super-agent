@@ -4,8 +4,10 @@
  * `.mjs` file loads it, editing a file or its sibling `.json` config reloads it, and
  * deleting a file disposes its fiber. Nothing here requires a process restart: cordis
  * resolves `inject` dependencies at runtime and unregisters a fiber's effects on dispose.
+ * A `<name>.disabled` marker beside `<name>.mjs` switches that extension off the same way.
  */
-import { copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, statSync, watch, type FSWatcher } from 'node:fs'
+import { createHash } from 'node:crypto'
+import { copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, statSync, watch, writeFileSync, type FSWatcher } from 'node:fs'
 import { join } from 'node:path'
 import { pathToFileURL } from 'node:url'
 import type { Context } from '@deepseek-ai/cordis'
@@ -25,28 +27,76 @@ interface Entry extends LoadedExtension { fiber?: { dispose(): Promise<void> } }
 const dynamicImport = new Function('specifier', 'return import(specifier)') as
   (specifier: string) => Promise<Record<string, unknown>>
 
+/** Whether a `<name>.disabled` marker in `directory` switches off the extension `<name>.mjs`; the marker's content does not matter. */
+const switchedOff = (directory: string, name: string): boolean => existsSync(join(directory, `${name}.disabled`))
+
+/** The extension files the loader mounts from `directory`: every `.mjs` without a `.disabled` marker beside it, in name order. */
+export function enabledExtensions(directory: string): string[] {
+  return readdirSync(directory).filter(file => file.endsWith('.mjs') && !switchedOff(directory, file.slice(0, -4))).sort()
+}
+
+/** What one seeding pass did, by file name (by extension name for `disabled`), for the log. */
+export interface SeedReport {
+  /** Copied because the directory did not have them. */
+  seeded: string[]
+  /** Replaced by the bundled version, which changed, because the operator had not changed the copy. */
+  upgraded: string[]
+  /** Kept although the bundled version changed, because the operator changed the copy. */
+  kept: string[]
+  /** Switched off by a `<name>.disabled` marker: neither copied nor upgraded. */
+  disabled: string[]
+}
+
+/** Records, by file name, the SHA-256 of the bundled version each copy in the directory was last made from. */
+const RECORD = '.bundled.json'
+const digest = (path: string): string => createHash('sha256').update(readFileSync(path)).digest('hex')
+function readRecord(path: string): Record<string, string> {
+  let parsed: unknown
+  try { parsed = JSON.parse(readFileSync(path, 'utf8')) }
+  catch { return {} } // No record yet, or an unreadable one: every copy then counts as made from the version bundled now.
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return {}
+  return Object.fromEntries(Object.entries(parsed).filter((entry): entry is [string, string] => typeof entry[1] === 'string'))
+}
+
 /**
  * Copies the extensions bundled with the package (such as `context-guard`) into the watched directory so they activate on a
- * fresh installation. The host's context-threshold rotation is driven entirely by `context-guard`; without this seeding the
- * bundled extension would sit in the package while the watched directory stayed empty, and the feature would never run.
- * A file the operator already has is never overwritten, so their edits to a bundled extension or its `.json` config survive
- * restarts and upgrades. Returns the names newly seeded, for the log.
+ * fresh installation, and keeps those copies current. The host's context-threshold rotation is driven entirely by
+ * `context-guard`; without this seeding the bundled extension would sit in the package while the watched directory stayed
+ * empty, and the feature would never run.
+ *
+ * Each `.mjs` and its `.json` is handled on its own. A missing file is copied. `.bundled.json` records the bundled version each
+ * copy was made from: a copy still equal to it is replaced when the bundled version changes, so an upgrade reaches it, while a
+ * copy the operator changed is never overwritten and is reported for as long as the bundled version differs from the one it
+ * was made from. A copy older than the record counts as made from the version bundled now, so it is never overwritten on that
+ * start. A `<name>.disabled` marker leaves that extension alone. `source` is the bundled directory, the package's by default.
  */
-export function seedBundledExtensions(directory: string): string[] {
-  const source = packagePath('extensions')
+export function seedBundledExtensions(directory: string, source = packagePath('extensions')): SeedReport {
+  const report: SeedReport = { seeded: [], upgraded: [], kept: [], disabled: [] }
   let names: string[]
   try { names = readdirSync(source).filter(name => name.endsWith('.mjs')).sort() }
-  catch { return [] } // No bundled extensions directory (a package built without it): nothing to seed.
+  catch { return report } // No bundled extensions directory (a package built without it): nothing to seed.
   mkdirSync(directory, { recursive: true })
-  const seeded: string[] = []
+  const recordPath = join(directory, RECORD)
+  const before = readRecord(recordPath)
+  const record = { ...before }
   for (const name of names) {
-    if (existsSync(join(directory, name))) continue
-    copyFileSync(join(source, name), join(directory, name))
-    const config = `${name.slice(0, -4)}.json`
-    if (existsSync(join(source, config)) && !existsSync(join(directory, config))) copyFileSync(join(source, config), join(directory, config))
-    seeded.push(name)
+    const extension = name.slice(0, -4)
+    if (switchedOff(directory, extension)) { report.disabled.push(extension); continue }
+    for (const file of [name, `${extension}.json`]) {
+      const bundled = join(source, file)
+      if (!existsSync(bundled)) continue
+      const target = join(directory, file)
+      const fresh = digest(bundled)
+      if (!existsSync(target)) { copyFileSync(bundled, target); record[file] = fresh; report.seeded.push(file); continue }
+      const current = digest(target)
+      const base = before[file] ?? fresh
+      if (current === fresh) record[file] = fresh
+      else if (current === base) { copyFileSync(bundled, target); record[file] = fresh; report.upgraded.push(file) }
+      else { record[file] = base; if (base !== fresh) report.kept.push(file) }
+    }
   }
-  return seeded
+  if (JSON.stringify(record) !== JSON.stringify(before)) writeFileSync(recordPath, `${JSON.stringify(record, null, 2)}\n`)
+  return report
 }
 
 /**
@@ -72,8 +122,14 @@ export class ExtensionLoader {
 
   start(): void {
     mkdirSync(this.directory, { recursive: true })
-    const seeded = seedBundledExtensions(this.directory)
-    if (seeded.length) this.ctx.logger.info('[extensions] seeded bundled extensions: %s', seeded.join(', '))
+    // Seeding is best-effort like loading: a file it cannot copy or read is logged, and the plugin starts with what is there.
+    try {
+      const { seeded, upgraded, kept, disabled } = seedBundledExtensions(this.directory)
+      if (seeded.length) this.ctx.logger.info('[extensions] seeded bundled extensions: %s', seeded.join(', '))
+      if (upgraded.length) this.ctx.logger.info('[extensions] upgraded bundled extensions to the version this package ships: %s', upgraded.join(', '))
+      for (const file of kept) this.ctx.logger.warn('[extensions] kept %s, which you changed, although this package ships a different version; delete it to get that version at the next start', file)
+      if (disabled.length) this.ctx.logger.info('[extensions] switched off by a .disabled marker: %s', disabled.join(', '))
+    } catch (error) { this.ctx.logger.warn('[extensions] cannot seed the bundled extensions: %s', String(error)) }
     void this.scan()
     try { this.watcher = watch(this.directory, () => this.requestScan()) }
     catch (error) { this.ctx.logger.warn('[extensions] file watching unavailable, polling only: %s', String(error)) }
@@ -99,7 +155,7 @@ export class ExtensionLoader {
     this.scanning = true
     try {
       let files: string[]
-      try { files = readdirSync(this.directory).filter(name => name.endsWith('.mjs')).sort() }
+      try { files = enabledExtensions(this.directory) }
       catch (error) { this.ctx.logger.warn('[extensions] cannot read directory: %s', String(error)); return }
       const present = new Set(files)
       for (const file of [...this.entries.keys()]) if (!present.has(file)) await this.unload(file)

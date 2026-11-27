@@ -1,7 +1,8 @@
 /**
  * The bundled context-guard extension must activate on a fresh installation: the host's context-threshold rotation is driven
- * entirely by it, so the loader seeds it from the package into the watched directory. These tests cover the seeding (never
- * overwriting the operator's file) and the extension's own logic from a real usage event to a rotation request.
+ * entirely by it, so the loader seeds it from the package into the watched directory. These tests cover the seeding (an upgrade
+ * replaces only a copy the operator left unchanged; a `.disabled` marker switches an extension off) and the extension's own
+ * logic from a real usage event to a rotation request.
  *
  * The extension logic is exercised by calling its `apply` directly with a stub context: the loader mounts plugins through a
  * `new Function` dynamic import that escapes the bundler's static graph, which vitest's VM module runner cannot perform
@@ -14,25 +15,82 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { Context } from '@deepseek-ai/cordis'
 import { describe, expect, it, vi } from 'vitest'
-import { extensionConfig, seedBundledExtensions } from '../src/app/extensions.ts'
+import { enabledExtensions, extensionConfig, seedBundledExtensions } from '../src/app/extensions.ts'
 import { SuperAgentHooks, type HooksHost } from '../src/app/hooks.ts'
 // @ts-ignore -- the bundled extension is plain ESM JavaScript shipped without a declaration file
 import { apply as contextGuard, name as guardName } from '../extensions/context-guard.mjs'
 
 const temp = (prefix: string): string => mkdtempSync(join(tmpdir(), prefix))
+/** A seeding pass that changed nothing. */
+const nothing = { seeded: [], upgraded: [], kept: [], disabled: [] }
+/** Writes one version of a stand-in bundled extension `guard`, with its config, into `directory`. */
+const bundle = (directory: string, version: number): void => {
+  writeFileSync(join(directory, 'guard.mjs'), `export const version = ${version}\n`)
+  writeFileSync(join(directory, 'guard.json'), `{"version":${version}}\n`)
+}
 
 describe('bundled extension seeding', () => {
-  it('seeds the bundled context-guard and its config into a fresh directory, and never overwrites the operator file', () => {
+  it('seeds the bundled context-guard and its config into a fresh directory, and keeps an operator edit', () => {
     const dir = temp('ext-seed-')
     try {
-      const seeded = seedBundledExtensions(dir)
-      expect(seeded).toContain('context-guard.mjs')
+      expect(seedBundledExtensions(dir).seeded).toEqual(['context-guard.mjs', 'context-guard.json'])
       expect(existsSync(join(dir, 'context-guard.mjs'))).toBe(true)
       expect(existsSync(join(dir, 'context-guard.json'))).toBe(true)
-      // An operator edit to the bundled config survives a later seeding (restart or upgrade).
+      // An operator edit to the bundled config survives a later seeding (a restart), silently while the bundled one is unchanged.
       writeFileSync(join(dir, 'context-guard.json'), '{"warnRatio":0.5,"hardRatio":0.6}')
-      expect(seedBundledExtensions(dir)).toEqual([])
+      expect(seedBundledExtensions(dir)).toEqual(nothing)
       expect(JSON.parse(readFileSync(join(dir, 'context-guard.json'), 'utf8')).warnRatio).toBe(0.5)
+    } finally { rmSync(dir, { recursive: true, force: true }) }
+  })
+
+  it('on an upgrade replaces a copy the operator left unchanged, and keeps and reports one they changed', () => {
+    const pkg = temp('ext-pkg-')
+    const dir = temp('ext-seed-')
+    try {
+      bundle(pkg, 1)
+      expect(seedBundledExtensions(dir, pkg).seeded).toEqual(['guard.mjs', 'guard.json'])
+      writeFileSync(join(dir, 'guard.json'), '{"version":1,"mine":true}\n')
+      bundle(pkg, 2)
+      expect(seedBundledExtensions(dir, pkg)).toEqual({ ...nothing, upgraded: ['guard.mjs'], kept: ['guard.json'] })
+      expect(readFileSync(join(dir, 'guard.mjs'), 'utf8')).toBe('export const version = 2\n')
+      expect(readFileSync(join(dir, 'guard.json'), 'utf8')).toBe('{"version":1,"mine":true}\n')
+      // The changed copy is reported on every start until the operator takes the bundled one by deleting theirs.
+      expect(seedBundledExtensions(dir, pkg)).toEqual({ ...nothing, kept: ['guard.json'] })
+      rmSync(join(dir, 'guard.json'))
+      expect(seedBundledExtensions(dir, pkg)).toEqual({ ...nothing, seeded: ['guard.json'] })
+      expect(readFileSync(join(dir, 'guard.json'), 'utf8')).toBe('{"version":2}\n')
+      expect(seedBundledExtensions(dir, pkg)).toEqual(nothing)
+    } finally { rmSync(pkg, { recursive: true, force: true }); rmSync(dir, { recursive: true, force: true }) }
+  })
+
+  it('never overwrites a copy seeded before the record existed, and upgrades it later only if it was unchanged', () => {
+    const pkg = temp('ext-pkg-')
+    const dir = temp('ext-seed-')
+    try {
+      // What an earlier version of the plugin left: copies without a record, the config tuned by the operator.
+      bundle(pkg, 1)
+      bundle(dir, 1)
+      writeFileSync(join(dir, 'guard.json'), '{"version":1,"mine":true}\n')
+      expect(seedBundledExtensions(dir, pkg)).toEqual(nothing)
+      expect(readFileSync(join(dir, 'guard.json'), 'utf8')).toBe('{"version":1,"mine":true}\n')
+      bundle(pkg, 2)
+      expect(seedBundledExtensions(dir, pkg)).toEqual({ ...nothing, upgraded: ['guard.mjs'], kept: ['guard.json'] })
+    } finally { rmSync(pkg, { recursive: true, force: true }); rmSync(dir, { recursive: true, force: true }) }
+  })
+
+  it('leaves alone, and does not mount, an extension a <name>.disabled marker switches off', () => {
+    const dir = temp('ext-seed-')
+    try {
+      writeFileSync(join(dir, 'context-guard.disabled'), '')
+      expect(seedBundledExtensions(dir)).toEqual({ ...nothing, disabled: ['context-guard'] })
+      expect(existsSync(join(dir, 'context-guard.mjs'))).toBe(false)
+      // The loader mounts only extensions without a marker, the operator's own included; deleting a marker brings its extension back.
+      writeFileSync(join(dir, 'context-guard.mjs'), 'export function apply() {}\n')
+      writeFileSync(join(dir, 'mine.mjs'), 'export function apply() {}\n')
+      writeFileSync(join(dir, 'mine.disabled'), '')
+      expect(enabledExtensions(dir)).toEqual([])
+      rmSync(join(dir, 'context-guard.disabled'))
+      expect(enabledExtensions(dir)).toEqual(['context-guard.mjs'])
     } finally { rmSync(dir, { recursive: true, force: true }) }
   })
 })

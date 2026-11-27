@@ -88,7 +88,9 @@ Run the profile-creation command only for a new installation. If the profile alr
 
 ### Bundled extensions
 
-On start the plugin seeds the extensions bundled with it from the package's `extensions/` directory into `<stateDir>/extensions`, which the extension loader watches. This includes `context-guard`, the extension that drives the context-threshold rotation of worker and foreman Sessions (warn at 35%, rotate at 40% of the model window; the main Session is exempt). A file already in `<stateDir>/extensions` is never overwritten, so your edits to a bundled extension or its `.json` config survive restarts and upgrades. Each extension is mounted with its `.json` over the plugin's `stateDir`, so `context-guard` pre-writes its handoff files to `<stateDir>/handoffs`; a key the `.json` sets, such as `handoffDir`, wins. To tune the context guard, edit `<stateDir>/extensions/context-guard.json` (`warnRatio`, `hardRatio`); to add your own extension, drop an `.mjs` file with an optional sibling `.json` config into the same directory.
+On start the plugin seeds the extensions bundled with it from the package's `extensions/` directory into `<stateDir>/extensions`, which the extension loader watches. This includes `context-guard`, the extension that drives the context-threshold rotation of worker and foreman Sessions (warn at 35%, rotate at 40% of the model window; the main Session is exempt). The plugin records in `<stateDir>/extensions/.bundled.json` which bundled version each copy was made from. On a later start, a copy you have not changed is replaced when the package ships a different version, so upgrades reach it; a copy you have changed is never overwritten, and while the package ships a different version of it, each start logs a warning naming it. To take the bundled version then, delete your copy: the next start copies it again. Each extension is mounted with its `.json` over the plugin's `stateDir`, so `context-guard` pre-writes its handoff files to `<stateDir>/handoffs`; a key the `.json` sets, such as `handoffDir`, wins. To tune the context guard, edit `<stateDir>/extensions/context-guard.json` (`warnRatio`, `hardRatio`); to add your own extension, drop an `.mjs` file with an optional sibling `.json` config into the same directory.
+
+To switch an extension off, bundled or your own, create `<name>.disabled` beside it in `<stateDir>/extensions`, for example `context-guard.disabled`; its content does not matter. The loader unloads the extension and does not load it again, and the plugin no longer copies or upgrades it. Without `context-guard`, worker and foreman Sessions are not rotated at the context threshold. Deleting a bundled file does not switch it off, since the next start copies it again. Delete the marker to switch the extension back on.
 
 ## Machine configuration
 
@@ -156,6 +158,8 @@ On the desktop build the plugin runs inside DeepSeek Harness, so switching it of
 | `scripts/superagent-uninstall.ps1` | Removes the marker, the start-up entries, and this plugin's loader entries from the profile's `cordis.patch.yml` (backed up beside it and checked afterwards). `-RemoveProgram -ProgramDir <dir>` also deletes the program directory. The state directory, ticket directories, sessions and delivered work stay (C-26) |
 
 The plugin reads `.disabled` before it mounts anything, so an installation switched off stays off even when DeepSeek Harness starts it. Close DeepSeek Harness before uninstalling, and open it again afterwards.
+
+`scripts/superagent-guard.ps1` keeps DeepSeek Harness running for the plugin: while the profile loads dsh-superagent and `.disabled` is absent, it starts DeepSeek Harness if it is not running. It finds `DeepSeek Harness.exe` through the installer's entry under the Windows `Uninstall` registry keys, then in the default install directories; `-Exe <path>` names it instead. If DeepSeek Harness needs starting but cannot be found, it prints a warning and exits 1.
 
 ## Settings
 
