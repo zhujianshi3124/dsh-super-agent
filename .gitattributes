@@ -1,0 +1,3 @@
+# Check out every text file with LF on every platform, whatever core.autocrlf says: the index is LF throughout,
+# tests/docs.spec.ts reads docs/007 line by line, and the POSIX scripts in scripts/ only run with LF line ends.
+* text=auto eol=lf

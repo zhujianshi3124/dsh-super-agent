@@ -931,9 +931,8 @@ it('tells the main Session of each requeue of the same Trigger', async () => {
 })
 
 
-// proper-lockfile's second-instance refusal does not trigger on Windows in this fixture; skipped there. The Windows
-// single-instance guarantee needs separate verification (see the review note), so this skip is not a claim that it holds.
-it.skipIf(process.platform === 'win32')('refuses a second process on the same state directory before it opens the database, so it migrates nothing', () => {
+// The second Runtime shares this process, so it is refused at once rather than waiting for a lock this process holds.
+it('refuses a second process on the same state directory before it opens the database, so it migrates nothing', () => {
   // A database the running build would read as schema 10 stays as it is.
   const db = new DatabaseSync(join(directory, 'orchestrator.sqlite'))
   db.prepare("UPDATE kv SET value='10' WHERE key='schema'").run()

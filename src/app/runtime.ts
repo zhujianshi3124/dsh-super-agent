@@ -10,7 +10,7 @@ import type {} from '@deepseek-ai/dsh-system-prompt'
 import type {} from '@deepseek-ai/dsh-tools'
 import type {} from '@deepseek-ai/dsh-skill'
 import type {} from '@deepseek-ai/dsh-subprocess'
-import { mkdirSync } from 'node:fs'
+import { mkdirSync, realpathSync } from 'node:fs'
 import { join } from 'node:path'
 import { lockSync } from 'proper-lockfile'
 import { Engine, key, reasonText, ticketStage, ticketStop, type EngineForSettings, type ReceiveResult, type Ticket, type Trigger } from '../core/index.ts'
@@ -62,6 +62,12 @@ const now = (): string => new Date().toISOString()
 const CONTEXT_HARD_RATIO = 0.4
 /** C-12a's warn line: between 35% and 40% only a small task the foreman judged may be dispatched to a session. */
 const CONTEXT_WARN_RATIO = 0.35
+/**
+ * The state directories whose lock a Runtime of this process holds. A second Runtime here on one of them is refused at once: waiting,
+ * as a new process waits out a force-closed one's lock, would block the event loop that keeps the holder's lock fresh, until the lock
+ * looked stale and was taken over and both Runtimes used one database.
+ */
+const lockedHere = new Set<string>()
 
 /**
  * Composition root of dsh-superagent that connects `Store`, `Setup`, `Engine`, `SourceRegistry`, `Effects`, `Outbox`, `Passes`, `Sessions`, `Settings`, `Prompts`, `DshExecutor`, and `MasterAssessor`.
@@ -122,7 +128,10 @@ export class Runtime extends Service implements SourceHost {
     const runtime = this
     // Lock the state directory before opening the database so another process cannot migrate or write concurrently.
     mkdirSync(machine.stateDir, { recursive: true, mode: 0o700 })
-    const compromised = (error: Error) => { this.runtimeHealth.set({ state: 'error', detail: error.message }); this.stopped.abort() }
+    // Within this process only another Runtime can hold the lock, and it cannot release it while this one waits: refuse at once.
+    const held = realpathSync.native(machine.stateDir)
+    if (lockedHere.has(held)) throw Object.assign(new Error(`Lock file is already being held by this process: ${held}`), { code: 'ELOCKED', file: held })
+    const compromised = (error: Error) => { lockedHere.delete(held); this.runtimeHealth.set({ state: 'error', detail: error.message }); this.stopped.abort() }
     // A force-closed instance leaves the lock behind until `stale` expires; the sync
     // api cannot retry itself, so wait it out. Without this, reopening DSH a few
     // seconds after killing it makes the whole plugin fail to start.
@@ -137,7 +146,9 @@ export class Runtime extends Service implements SourceHost {
         }
       }
     }
-    const release = acquire()
+    const unlock = acquire()
+    lockedHere.add(held)
+    const release = (): void => { lockedHere.delete(held); unlock() }
     this.releaseLock = async () => { release() }
     let opened: Store | undefined
     try {
@@ -172,7 +183,8 @@ export class Runtime extends Service implements SourceHost {
           return ticket ? { title: ticket.title, assignment: ticket.execution?.assignment, directory: ticket.execution?.directory } : undefined
         },
       })
-      this.extensions = new ExtensionLoader(ctx, join(machine.stateDir, 'extensions'))
+      // Each extension gets the state directory as a default, so context-guard pre-writes its handoffs under it, not in the home directory.
+      this.extensions = new ExtensionLoader(ctx, join(machine.stateDir, 'extensions'), { stateDir: machine.stateDir })
       const commands = this.commands = new Commands(() => setup.deployment, setup.commandEnvironment, this.lifetime)
       const board = this.board
       const effects = this.effects = new Effects(store, board)

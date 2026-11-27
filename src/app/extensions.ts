@@ -49,6 +49,15 @@ export function seedBundledExtensions(directory: string): string[] {
   return seeded
 }
 
+/**
+ * The configuration an extension is mounted with: its sibling `.json` over the host defaults, such as the plugin's state directory,
+ * so a bundled extension writes where this installation keeps its state. A key the `.json` sets wins.
+ */
+export function extensionConfig(configPath: string, defaults: Readonly<Record<string, unknown>> = {}): Record<string, unknown> {
+  const own = existsSync(configPath) ? JSON.parse(readFileSync(configPath, 'utf8')) as Record<string, unknown> : {}
+  return { ...defaults, ...own }
+}
+
 /** Watches an extension directory and mounts, reloads or disposes each plugin fiber without restarting the host. */
 export class ExtensionLoader {
   private readonly entries = new Map<string, Entry>()
@@ -59,7 +68,7 @@ export class ExtensionLoader {
   private pending = false
   private stopped = false
 
-  constructor(private readonly ctx: Context, readonly directory: string) {}
+  constructor(private readonly ctx: Context, readonly directory: string, readonly defaults: Readonly<Record<string, unknown>> = {}) {}
 
   start(): void {
     mkdirSync(this.directory, { recursive: true })
@@ -119,8 +128,7 @@ export class ExtensionLoader {
         ? loaded.default : loaded
       const plugin = exported as { name?: string; apply?: unknown; inject?: unknown }
       if (typeof plugin.apply !== 'function') throw new Error('plugin must export an apply function')
-      let config: Record<string, unknown> = {}
-      if (existsSync(configPath)) config = JSON.parse(readFileSync(configPath, 'utf8')) as Record<string, unknown>
+      const config = extensionConfig(configPath, this.defaults)
       const pending = this.ctx.plugin(plugin as Parameters<Context['plugin']>[0], config)
       const fiber = await pending
       this.entries.set(file, { file, name: plugin.name ?? file, version, loadedAt, fiber })
