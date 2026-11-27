@@ -324,7 +324,8 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/app/store-read.ts` | `storeReads`: the Store's read queries for the views, the tools and the Sources' polls, which never write |
 | `src/app/migration.ts` | The schema 11 migration: one step from schema 10 that writes every stored record in its current shape |
 | `src/app/effects.ts` | Effects |
-| `src/app/budget.ts` | `Budget`: the person's limits on managed work (tickets an hour, minutes per assignment, model tokens a day), the local-day token record they are counted by, and `localDay` and `tokensOf` |
+| `src/app/stuck.ts` | `StuckWatch`: a working session whose model has had no action and whose context has not grown for the whole threshold is stuck; one notice per episode to its superior (a worker to the foreman, the foreman to the main Session), the main Session itself unwatched |
+| `src/app/wrapup.ts` | The person's wrap-up and start of work: wrapping up holds every launch and settles each open ticket at a clean node through the foreman, the panel showing when it is safe to shut down; starting work lifts the hold and continues the unfinished tasks under their original confirmed instructions |
 | `src/app/versions.ts` | `Versions`: a record kept as numbered snapshots with a pointer to the current one, for the settings and the prompts |
 | `src/app/cache.ts` | `TextCache`: texts kept in memory within a size, the least recently used dropped first |
 | `src/app/settings.ts` | Settings |
@@ -390,8 +391,9 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/client/api.ts` | Calls and polls of the management API, typed by `src/app/api.ts`, and the Decision filters of the Eval status |
 | `src/client/route.ts` | The tabs, the settings groups, the typed routes that `parseRoute` reads, and the route memory with the settings group opened last |
 | `src/client/overview.tsx` | The overview |
-| `src/client/source.tsx`, `trigger.tsx`, `eval.tsx`, `execution.tsx` | One file per stage: its status, and its settings where it has some |
-| `src/client/thread.tsx`, `ticket.tsx` | The record pages: a Thread with its timeline, and a Ticket with its authorization, Inputs and Assignments |
+| `src/client/execution.tsx` | The execution stage page: its status, and its settings where it has some |
+| `src/client/ticket.tsx` | The Ticket record page: its authorization, Inputs and Assignments |
+| `src/client/proposal.tsx` | The instruction detail page (read-only): its number, state and times, the person's own words, every task's full text and the tickets it dispatched |
 | `src/client/settings.tsx` | The Settings tab: the group navigation and the group on screen |
 | `src/client/settings-kit.tsx` | The building blocks of settings blocks: the settings the stage groups share, `useBlockDraft`, the fields, among them a Source kind's, and the history of saves |
 | `src/client/prompts.tsx` | The Prompts settings: the page owns the view it read and its editor the draft, and the Edit, Full prompt and History tabs render from them; a built-in part's editor shows a changed default and keeps or drops the override |
@@ -448,18 +450,19 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `tests/deployment.spec.ts`, `tests/environment.spec.ts`, `tests/index.spec.ts` | The plugin configuration and setup, the agent's process environment, the plugin entry |
 | `tests/master-workspace.spec.ts` | The main Session's own workspace, and the move of the main slot into it |
 | `tests/turn-fallback.spec.ts` | A foreman turn that ended in a provider error: the notice the main Session gets, the one redelivery, and the stop after it |
-| `tests/foreman.spec.ts`, `tests/foreman-switch.spec.ts` | The foreman slot, its instruction text and handoff, and the settings switch that turns it on |
+| `tests/foreman.spec.ts` | The foreman slot, its instruction text and handoff |
 | `tests/stuck.spec.ts` | `StuckWatch`: the dual signal of model action and context growth, one report per episode, the grace, the adjudication exemption, idle sessions, and the live threshold |
 | `tests/foreman-mechanisms.spec.ts` | The foreman mechanisms on a running host: the stuck stop, the emergency stop, the named-session wait's three decisions, one live ticket per task and its continuation, the foreman replacement, and the adjudication relay |
 | `tests/worker-continuation.spec.ts` | A worker that stops before its ticket is done goes on (C-13b, C-13e): the successor at the context threshold starts at once with no message and tells nobody; a ticket stopped halfway is continued with the fixed sentence (in the successor when a rotation waits) or ended failed, each recorded; tickets that still work or wait for the person are refused |
 | `tests/proposals.spec.ts` | Numbered instructions: drafting, who may confirm, and the gate that refuses Tickets without an approved one |
 | `tests/chief-source.spec.ts` | A message in the main Session as a Trigger: the instruction the person confirms, the ticket the foreman opens under it with that Trigger, its worker, and the report back to the main Session |
 | `tests/worker-workspace.spec.ts` | Where a worker Session lands: the one workspace of the execution root rather than one per ticket, the ticket's own directory under it that the environment names, and the worker prompt's rule to change nothing outside it |
-| `tests/budget.spec.ts` | The person's budget: how a model step is counted, the local day's record, each limit's refusal, and where a tripped limit acts — a refused accept, a held launch, and a running assignment stopped as a blocked report |
-| `tests/panel-deployment.spec.tsx`, `tests/panel-source.spec.tsx`, `tests/panel-eval.spec.tsx`, `tests/panel-execution.spec.tsx`, `tests/panel-prompts.spec.tsx`, `tests/panel-trigger.spec.tsx`, `tests/panel-panel.spec.tsx` | The panel pages, each rendered against its view data |
+| `tests/wrap-up.spec.ts` | The person's wrap-up and start of work: wrapping up holds launches and reaches every worker through the foreman, each settles at a clean node and its ticket ends wrapped, the panel says when it is safe to shut down, and starting work continues the unfinished tasks under their original instructions |
+| `tests/extension-seed.spec.ts` | The bundled context-guard extension: the loader seeds it into the watched directory without overwriting the operator's file, and its logic reports real usage, files a rotation request past the hard threshold and exempts the main Session |
+| `tests/panel-deployment.spec.tsx`, `tests/panel-execution.spec.tsx`, `tests/panel-prompts.spec.tsx`, `tests/panel-panel.spec.tsx` | The panel pages, each rendered against its view data |
 | `tests/service-script.spec.ts` | `scripts/dsh-superagent` against fake `ps`, `tmux` and `dsh` |
 | `tests/client.spec.tsx`, `tests/navigation.spec.ts`, `tests/controls.spec.tsx` | The client plugin's registration and polling, Session navigation and route memory, the local controls, and the panel's imports, which have no cycle |
-| `tests/panel-overview.spec.tsx`, `panel-source.spec.tsx`, `panel-trigger.spec.tsx`, `panel-eval.spec.tsx`, `panel-execution.spec.tsx` | Each page of the panel, against a fake management API answered by route |
+| `tests/panel-overview.spec.tsx`, `panel-execution.spec.tsx` | Each page of the panel, against a fake management API answered by route |
 | `tests/panel-settings.spec.tsx`, `panel-prompts.spec.tsx`, `panel-deployment.spec.tsx`, `panel-panel.spec.tsx` | The settings groups, drafts and history, the prompts, the Deployment page, and the panel's search, glossary and route memory |
 | `tests/draft.spec.ts`, `tests/prompt-config.spec.ts`, `tests/markdown.spec.ts`, `tests/marks.spec.ts` | Draft states, merges and the save bar's line; the prompt configuration by section and the line diff; the Markdown subset and its links; the mark of every state the views classify |
 | `tests/locales.spec.ts`, `tests/styles.spec.ts` | The copy in both languages, the stylesheet |

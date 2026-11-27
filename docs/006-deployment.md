@@ -86,6 +86,10 @@ The fourth command creates `~/.dsh/profiles/superagent` from the DeepSeek Harnes
 
 Run the profile-creation command only for a new installation. If the profile already exists, that command replaces it and deletes its `cordis.patch.yml`, including machine configuration. Do not use it for upgrades.
 
+### Bundled extensions
+
+On start the plugin seeds the extensions bundled with it from the package's `extensions/` directory into `<stateDir>/extensions`, which the extension loader watches. This includes `context-guard`, the extension that drives the context-threshold rotation of worker and foreman Sessions (warn at 35%, rotate at 40% of the model window; the main Session is exempt). A file already in `<stateDir>/extensions` is never overwritten, so your edits to a bundled extension or its `.json` config survive restarts and upgrades. To tune the context guard, edit `<stateDir>/extensions/context-guard.json` (`warnRatio`, `hardRatio`); to add your own extension, drop an `.mjs` file with an optional sibling `.json` config into the same directory.
+
 ## Machine configuration
 
 Copy [examples/profile.cordis.patch.yml](../examples/profile.cordis.patch.yml) to `~/.dsh/profiles/superagent/cordis.patch.yml`, replacing that file, and replace every `<placeholder>`. For Feishu, also enable the `dsh-superagent-feishu` entry there. The `webserver` entry sets the panel's port.

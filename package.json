@@ -1,12 +1,12 @@
 {
   "name": "dsh-superagent",
-  "author": "DeepSeek Harness Team <team@dsh.dev>",
+  "author": "zhujianshi3124 (https://github.com/zhujianshi3124)",
   "license": "MIT",
   "version": "0.1.0",
   "private": true,
   "description": "A proactive agent for one GitHub repository, as a DSH (DeepSeek Harness) bundle: it listens to GitHub and optionally Feishu, evaluates requests under a Policy, turns authorized ones into Tickets, and executes each in its own DSH Session.",
   "contributors": [
-    "zhujianshi3124 (https://github.com/zhujianshi3124)"
+    "DeepSeek Harness Team (upstream dsh-superagent-prototype)"
   ],
   "homepage": "https://github.com/zhujianshi3124/dsh-super-agent#readme",
   "repository": {
@@ -36,7 +36,9 @@
     "locale/*.json",
     "README.md",
     "prompts",
-    "skills"
+    "skills",
+    "extensions",
+    "scripts"
   ],
   "dsh": {
     "bundle": {

@@ -5,10 +5,11 @@
  * deleting a file disposes its fiber. Nothing here requires a process restart: cordis
  * resolves `inject` dependencies at runtime and unregisters a fiber's effects on dispose.
  */
-import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, watch, type FSWatcher } from 'node:fs'
+import { copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, statSync, watch, type FSWatcher } from 'node:fs'
 import { join } from 'node:path'
 import { pathToFileURL } from 'node:url'
 import type { Context } from '@deepseek-ai/cordis'
+import { packagePath } from '../infra/paths.ts'
 import type {} from './hooks.ts'
 
 export interface LoadedExtension {
@@ -24,6 +25,30 @@ interface Entry extends LoadedExtension { fiber?: { dispose(): Promise<void> } }
 const dynamicImport = new Function('specifier', 'return import(specifier)') as
   (specifier: string) => Promise<Record<string, unknown>>
 
+/**
+ * Copies the extensions bundled with the package (such as `context-guard`) into the watched directory so they activate on a
+ * fresh installation. The host's context-threshold rotation is driven entirely by `context-guard`; without this seeding the
+ * bundled extension would sit in the package while the watched directory stayed empty, and the feature would never run.
+ * A file the operator already has is never overwritten, so their edits to a bundled extension or its `.json` config survive
+ * restarts and upgrades. Returns the names newly seeded, for the log.
+ */
+export function seedBundledExtensions(directory: string): string[] {
+  const source = packagePath('extensions')
+  let names: string[]
+  try { names = readdirSync(source).filter(name => name.endsWith('.mjs')).sort() }
+  catch { return [] } // No bundled extensions directory (a package built without it): nothing to seed.
+  mkdirSync(directory, { recursive: true })
+  const seeded: string[] = []
+  for (const name of names) {
+    if (existsSync(join(directory, name))) continue
+    copyFileSync(join(source, name), join(directory, name))
+    const config = `${name.slice(0, -4)}.json`
+    if (existsSync(join(source, config)) && !existsSync(join(directory, config))) copyFileSync(join(source, config), join(directory, config))
+    seeded.push(name)
+  }
+  return seeded
+}
+
 /** Watches an extension directory and mounts, reloads or disposes each plugin fiber without restarting the host. */
 export class ExtensionLoader {
   private readonly entries = new Map<string, Entry>()
@@ -38,6 +63,8 @@ export class ExtensionLoader {
 
   start(): void {
     mkdirSync(this.directory, { recursive: true })
+    const seeded = seedBundledExtensions(this.directory)
+    if (seeded.length) this.ctx.logger.info('[extensions] seeded bundled extensions: %s', seeded.join(', '))
     void this.scan()
     try { this.watcher = watch(this.directory, () => this.requestScan()) }
     catch (error) { this.ctx.logger.warn('[extensions] file watching unavailable, polling only: %s', String(error)) }
