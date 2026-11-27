@@ -442,7 +442,7 @@ const TEXT = {
   'term.stage': ['阶段观察', 'Stage observations'],
   'term.stopReason': ['停止原因', 'Stop reasons'],
   'term.proposalStatus': ['清单状态', 'Instruction states'],
-  'meaning.mainSession': ['用户打字的窗口，固定 D:\\chief；听懂需求、起草指令清单、转达、一句话报结果，不亲自执行', 'The window the person types in, fixed at D:\\chief; understands the request, drafts instructions, relays, and reports results in one sentence — never does the work itself'],
+  'meaning.mainSession': ['用户打字的窗口，默认 D:\\chief（部署设置可改）；听懂需求、起草指令清单、转达、一句话报结果，不亲自执行', 'The window the person types in, D:\\chief by default (the deployment settings can change it); understands the request, drafts instructions, relays, and reports results in one sentence — never does the work itself'],
   'meaning.foreman': ['固定 D:\\gongtou；拆工单、派工单、换方案、调度、汇总问题，不亲自执行', 'Fixed at D:\\gongtou; splits instructions into tickets, dispatches them, changes plans, schedules, and collects questions — never does the work itself'],
   'meaning.workerSession': ['真正干活的会话；一张工单任一时刻只由一个工人会话持有', 'The Session that actually does the work; one ticket is held by exactly one worker Session at any time'],
   'meaning.subagent': ['工人临时叫的帮手，不占工单名额', 'A helper a worker calls temporarily; it takes no ticket slot'],

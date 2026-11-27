@@ -30,6 +30,8 @@ export class Setup {
   /** Environment variables pointing agent subprocesses at the isolated git config and command shims. */
   private readonly variables: Record<string, string | undefined>
   private restoreEnvironment?: () => void
+  /** Whether setup ran local-only, binding no account: it then writes and applies no worker environment. */
+  private localOnly = false
   constructor(private readonly host: SetupHost) {
     this.path = withoutDirectory(process.env.PATH ?? '', workerBin(host.machine.stateDir))
     this.variables = agentVariables(host.machine.stateDir)
@@ -65,7 +67,7 @@ export class Setup {
     await check.catch((error: unknown) => { if (!(error instanceof SetupError) || error.place === block.slice(7)) throw error })
   }
   async blockCommands(blocked: readonly string[]): Promise<void> {
-    if (this.resolved) await writeEnvironment(this.resolved, blocked)
+    if (this.resolved && !this.localOnly) await writeEnvironment(this.resolved, blocked)
   }
   restore(): void { this.restoreEnvironment?.(); this.restoreEnvironment = undefined }
   /** Probes CLIs the way worker shells run them, using `stateDir` as `cwd` since it exists even before the repository clone is valid. */
@@ -94,9 +96,14 @@ export class Setup {
       if (error instanceof SetupError) throw error
       throw new SetupError('environmentFailed', { output: error instanceof Error ? error.message : String(error) })
     }
-    if (!localOnly) await writeEnvironment(resolved, settings.executor.blockedCommands).catch(machineProblem)
+    // Local-only binds no account, so it writes no shims or git configuration and leaves the process environment alone:
+    // pointing every Session's git at a configuration nothing wrote for this machine, such as one an earlier setup left,
+    // would cut it off from the operator's own git configuration and credentials.
+    this.localOnly = localOnly
+    if (localOnly) return resolved
+    await writeEnvironment(resolved, settings.executor.blockedCommands).catch(machineProblem)
     this.restoreEnvironment = applyEnvironment(this.variables, machine.stateDir, this.path)
-    if (!localOnly) await verifyEnvironment(resolved, context.subprocess, lifetime).catch((error: unknown) => {
+    await verifyEnvironment(resolved, context.subprocess, lifetime).catch((error: unknown) => {
       this.restore()
       machineProblem(error)
     })

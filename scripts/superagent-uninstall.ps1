@@ -1,16 +1,19 @@
-# Removes the super-agent installation completely, one command (C-26a).
+﻿# Removes the super-agent installation completely, one command (C-26a).
 #
-# What it removes, in this order:
-#   1. the `.disabled` marker: the plugin loads nothing after a restart, even if something still names it;
-#   2. start-up entries whose name names this installation (`superagent` / `dsh-superagent`), in the Run key and the Startup folder;
-#   3. the plugin's loader entries in the DSH profile's cordis.patch.yml, after backing that file up beside itself;
-#   4. with -RemoveProgram -ProgramDir <dir>, the plugin's program directory itself (the built `lib`).
+# What it does, in this order:
+#   1. writes the `.disabled` marker, so the plugin loads nothing after a restart, even if something still names it;
+#   2. removes start-up entries whose name names this installation (`superagent` / `dsh-superagent`), in the Run key and the Startup folder;
+#   3. removes the plugin's loader entries in the DSH profile's cordis.patch.yml, after backing that file up beside itself;
+#   4. with -RemoveProgram -ProgramDir <dir>, removes the plugin's program directory itself (the built `lib`).
 #
 # What it never touches (C-26): the state directory (database, ticket directories, handoffs), DSH's own settings other than this
 # plugin's entries, sessions, and anything already delivered. Deleting the state directory is the person's own decision.
 #
 # DSH is left running: close it and open it again for the removal to take effect (C-26a allows a cold restart). It stops no
-# process and asks nothing.
+# process; without -Yes it asks once before it changes anything.
+#
+# Keep this file UTF-8 with a BOM: without one, Windows PowerShell 5.1 reads it in the system code page, and the Chinese
+# messages below no longer parse.
 param(
   [string]$Profile = (Join-Path $env:USERPROFILE '.dsh\profiles\desktop'),
   [string]$StateDir = (Join-Path $env:USERPROFILE '.dsh\state\superagent'),
@@ -24,7 +27,7 @@ if ($RemoveProgram -and -not $ProgramDir) { Say '用 -RemoveProgram 时要同时
 
 Say '== super-agent 卸载 =='
 if (-not $Yes) {
-  Say "将删除：开机/启动项、DSH 配置里 dsh-superagent 的加载条目、以及“禁用”标记。"
+  Say "将写入禁用标记（.disabled），并删除：开机/启动项、DSH 配置里 dsh-superagent 的加载条目。"
   Say "将保留：状态库 ($StateDir)、工单目录、会话历史、已交付的东西。"
   if ($RemoveProgram) { Say "另外将删除程序目录：$ProgramDir" }
   $answer = Read-Host '确认继续？输入 yes 回车'

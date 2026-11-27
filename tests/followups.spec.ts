@@ -4,6 +4,9 @@ import { CHAT, feishu, startRuntime, type Host } from './fixtures/host.ts'
 import { repliedTo } from '../src/app/links.ts'
 import { inputMessage } from '../src/executor/dsh.ts'
 
+// Each case starts a whole Runtime, which can take longer than the default 5 seconds while the full suite runs in parallel.
+vi.setConfig({ testTimeout: 15_000 })
+
 let h: Host | undefined
 afterEach(async () => { await h?.stop(); h = undefined })
 const THREAD = `feishu:${CHAT}:om_1`

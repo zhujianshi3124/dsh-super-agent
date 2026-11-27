@@ -1,9 +1,9 @@
 import { Context } from '@deepseek-ai/cordis'
 import { bindScopeParent } from '@deepseek-ai/dsh-scope'
-import { mkdtempSync, rmSync } from 'node:fs'
+import { existsSync, mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { DatabaseSync } from 'node:sqlite'
-import { join } from 'node:path'
+import { delimiter, join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, expectTypeOf, it, vi } from 'vitest'
 import type { UserMessage } from '@deepseek-ai/dsh-llm'
 import { renderPrompt } from '@deepseek-ai/dsh-system-prompt'
@@ -95,13 +95,15 @@ const subprocess = { spawn: vi.fn((spec: { argv: readonly string[] }) => {
   const reader = (text: string) => ({ readFrom: () => ({ text, nextOffset: text.length, lossy: false }) })
   return { done: Promise.resolve({ exitCode: answer instanceof Error ? 1 : 0, signal: null }), collected: { stdout: reader(answer instanceof Error ? '' : answer), stderr: reader(answer instanceof Error ? answer.message : '') } }
 }) }
-/** Source account overrides for test setup; `feishu: null` disables the Feishu source. */
-interface Accounts { github?: Record<string, unknown>; feishu?: Record<string, unknown> | null }
+/** Source account overrides for test setup; `github: null` switches the GitHub Source off, as the desktop build does, and `feishu: null` disables the Feishu source. */
+interface Accounts { github?: Record<string, unknown> | null; feishu?: Record<string, unknown> | null }
 function seed(store: Store, accounts: Accounts = {}): void {
   const settings = store.settings()
   const { feishu: _feishu, ...others } = settings.sources
   const feishu = accounts.feishu === null ? undefined : { ...settings.sources.feishu?.config, cli: BOT(), ...accounts.feishu }
-  store.saveSettings(SettingsSchema.parse({ ...settings, executor: { ...settings.executor, directory: join(directory, 'tickets') }, sources: { ...others, github: { enabled: true, config: { repository: 'acme/widgets', cli: AGENT(), ...accounts.github } }, ...feishu ? { feishu: { enabled: true, config: feishu } } : {} } }))
+  const github = accounts.github === null ? { enabled: false, config: { repository: 'acme/widgets', cli: '' } }
+    : { enabled: true, config: { repository: 'acme/widgets', cli: AGENT(), ...accounts.github } }
+  store.saveSettings(SettingsSchema.parse({ ...settings, executor: { ...settings.executor, directory: join(directory, 'tickets') }, sources: { ...others, github, ...feishu ? { feishu: { enabled: true, config: feishu } } : {} } }))
 }
 let restarts: ReturnType<typeof vi.fn<() => void>>
 async function restart(machine: Partial<Machine> = {}, accounts: Accounts = {}): Promise<Runtime> {
@@ -704,6 +706,17 @@ it('runs setup again while the Feishu bot check failed, and restores the process
   expect(broken.setupProblem).toMatchObject({ place: 'deployment', code: 'gitTooOld' })
   expect(process.env.GIT_CONFIG_GLOBAL).toBeUndefined()
   expect(process.env.PATH?.split(':')).not.toContain(join(directory, 'worker-bin'))
+})
+
+it('leaves the process environment alone in a local-only installation, which writes no shims, even where an earlier setup left them', async () => {
+  // The setup that started this Runtime wrote worker-bin and worker-gitconfig; a local-only one must not put them to use.
+  expect(existsSync(workerGitConfig(directory))).toBe(true)
+  const next = await restart({}, { github: null, feishu: null })
+  await next.ready
+  expect(next.configured()).toBe(true)
+  expect(process.env.GIT_CONFIG_GLOBAL).toBeUndefined()
+  expect(process.env.GIT_CONFIG_NOSYSTEM).toBeUndefined()
+  expect(process.env.PATH?.split(delimiter)).not.toContain(join(directory, 'worker-bin'))
 })
 
 it.skipIf(process.platform === 'win32')('writes worker shims and the agent environment from the configuration only, and restores the environment on stop', async () => {

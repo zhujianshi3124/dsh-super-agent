@@ -63,7 +63,7 @@ describe('bundled extension seeding', () => {
     } finally { rmSync(pkg, { recursive: true, force: true }); rmSync(dir, { recursive: true, force: true }) }
   })
 
-  it('never overwrites a copy seeded before the record existed, and upgrades it later only if it was unchanged', () => {
+  it('never overwrites a copy seeded before the record existed, reports one that differs, and upgrades it later only if it was unchanged', () => {
     const pkg = temp('ext-pkg-')
     const dir = temp('ext-seed-')
     try {
@@ -71,10 +71,28 @@ describe('bundled extension seeding', () => {
       bundle(pkg, 1)
       bundle(dir, 1)
       writeFileSync(join(dir, 'guard.json'), '{"version":1,"mine":true}\n')
-      expect(seedBundledExtensions(dir, pkg)).toEqual(nothing)
+      expect(seedBundledExtensions(dir, pkg)).toEqual({ ...nothing, kept: ['guard.json'] })
       expect(readFileSync(join(dir, 'guard.json'), 'utf8')).toBe('{"version":1,"mine":true}\n')
       bundle(pkg, 2)
       expect(seedBundledExtensions(dir, pkg)).toEqual({ ...nothing, upgraded: ['guard.mjs'], kept: ['guard.json'] })
+    } finally { rmSync(pkg, { recursive: true, force: true }); rmSync(dir, { recursive: true, force: true }) }
+  })
+
+  it('keeps and reports on every start a copy left before the record existed, when the package already ships another version', () => {
+    const pkg = temp('ext-pkg-')
+    const dir = temp('ext-seed-')
+    try {
+      // An earlier version of the plugin left version 1 without a record; the package this start runs ships version 2.
+      bundle(dir, 1)
+      bundle(pkg, 2)
+      expect(seedBundledExtensions(dir, pkg)).toEqual({ ...nothing, kept: ['guard.mjs', 'guard.json'] })
+      expect(readFileSync(join(dir, 'guard.mjs'), 'utf8')).toBe('export const version = 1\n')
+      // Nothing records the copies as made from version 2, so the next start reports them again instead of going quiet.
+      expect(existsSync(join(dir, '.bundled.json'))).toBe(false)
+      expect(seedBundledExtensions(dir, pkg)).toEqual({ ...nothing, kept: ['guard.mjs', 'guard.json'] })
+      rmSync(join(dir, 'guard.mjs'))
+      expect(seedBundledExtensions(dir, pkg)).toEqual({ ...nothing, seeded: ['guard.mjs'], kept: ['guard.json'] })
+      expect(readFileSync(join(dir, 'guard.mjs'), 'utf8')).toBe('export const version = 2\n')
     } finally { rmSync(pkg, { recursive: true, force: true }); rmSync(dir, { recursive: true, force: true }) }
   })
 
