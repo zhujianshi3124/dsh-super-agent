@@ -16,12 +16,12 @@ The bundle defines `dsh-superagent-worker` for Executors and `dsh-superagent-rou
 
 Opening a blank managed Session in the Web UI can select the profile's default preset. dsh-superagent restores its role-specific preset before the first turn.
 
-Both presets run with `danger-full-access` as the operator's OS user and read messages from subscribed Threads. Account wrappers choose the agent's credentials by default; they do not isolate the process. A worker can execute programs by path and read the operator's home directory. For isolation, use a dedicated OS account containing only the agent's credentials.
+Both presets run with `danger-full-access` as the operator's OS user and read messages from subscribed Threads. Account wrappers, or the agent's gh configuration directory, choose the agent's credentials by default; they do not isolate the process. A worker can execute programs by path and read the operator's home directory. For isolation, use a dedicated OS account containing only the agent's credentials.
 
 ## Prerequisites
 
 - Node.js 22.19+ or 24+, pnpm, git 2.32+, Python 3.8+ and tmux
-- GitHub CLI (`gh`) 2.48 or later. Source CLI fields must point to `gh` or `lark-cli` wrappers; the host relies on their subcommands and output formats.
+- GitHub CLI (`gh`) 2.48 or later. Source CLI fields must point to `gh` or `lark-cli`, or wrappers of them; the host relies on their subcommands and output formats. On Windows they must be programs, such as `gh.exe`: dsh-superagent starts a CLI without a shell, which a wrapper script would need. The GitHub card's gh configuration directory then chooses the agent's account (see Agent GitHub account); the Feishu Source has no such setting, and Feishu on Windows is untested.
 - A repository on github.com; GitHub Enterprise Server is not supported. To create a checkout per Ticket, keep a local clone from which the prepare command can add worktrees. Install `git-lfs` if that repository uses Git LFS.
 - A model provider configured for DeepSeek Harness. dsh-superagent uses the profile's default model unless the Eval or Execution settings name another.
 - For Feishu: `lark-cli` (tested with 1.0.90) and a Feishu or Lark app with a bot
@@ -45,6 +45,17 @@ Both presets run with `danger-full-access` as the operator's OS user and read me
    ```
 
    Sign in as the agent account; the last command prints its login. dsh-superagent reads the login the same way.
+
+   Or, without a wrapper, set the GitHub card's **gh configuration directory** to the directory the agent account is signed in to, and its CLI to `gh` itself: dsh-superagent runs the agent's `gh` with that directory as `GH_CONFIG_DIR`, in setup's checks, in worker shells and in its own commands. On Windows, where the CLI must be a program, this is the way:
+
+   ```powershell
+   winget install GitHub.cli
+   $env:GH_CONFIG_DIR = "$env:USERPROFILE\.config\gh-agent"
+   gh auth login
+   gh api user --jq .login
+   ```
+
+   Run the last three in a new PowerShell window, which has the installed `gh` on `PATH`. On the GitHub card, set the CLI to `gh`, or the full path of `gh.exe`, such as `C:\Program Files\GitHub CLI\gh.exe`, and the gh configuration directory to the full path of that folder, such as `C:\Users\you\.config\gh-agent`. A command name is looked up on the `PATH` DeepSeek Harness started with: restart it after installing gh, or set the full path.
 
 ### Feishu bot (optional)
 
@@ -220,7 +231,7 @@ A refusal has a status and `error`, its English text:
 
 The blocks:
 
-- `source:github`, `source:feishu`: `{"enabled": true, "config": {…}}`. GitHub's config has `repository` and `cli`, and the switches `observeIssues`, `observePulls`, `observeComments` and `observeCi`, off by default, which receive every new Issue, new pull request and comment in the repository and the default branch's CI; Feishu's has `cli`, `chats` as `[{"chatId": "oc_…", "name": "…", "listen": "mentions"}]` (or `"all"`), `directMessages`, and `otherChats` as `"none"` or `"mentions"`.
+- `source:github`, `source:feishu`: `{"enabled": true, "config": {…}}`. GitHub's config has `repository`, `cli` and `configDir`, the agent's gh configuration directory or `""`, and the switches `observeIssues`, `observePulls`, `observeComments` and `observeCi`, off by default, which receive every new Issue, new pull request and comment in the repository and the default branch's CI; Feishu's has `cli`, `chats` as `[{"chatId": "oc_…", "name": "…", "listen": "mentions"}]` (or `"all"`), `directMessages`, and `otherChats` as `"none"` or `"mentions"`.
 - `policy`: `{"rules": […], "sources": {"github": {"allowed": [{"id": "<login>"}], "bots": [{"id": "dependabot[bot]"}]}, "feishu": {"allowed": [{"id": "ou_…", "name": "…"}], "syncChat": "oc_…", "admission": {"oc_…": {"unlistedAddressed": "explicit"}}}}}`. `bots` lists the bots whose messages may become inferred candidates. An `admission` row is keyed by chat id, `other` or `direct` for Feishu, and by `issues`, `pulls`, `comments` or `ci` for GitHub; an unset cell takes its default (see [002 Authorization](002-authorization.md)).
 - `eval`: `mode`, `timeoutSeconds` and `model`.
 - `executor`: `model`, `maxWorkers`, `directory`, `prepare`, `blockedCommands` and `budget`, which is `{"ticketsPerHour": 0, "ticketMinutes": 0, "dailyTokens": 0}` with each limit off at zero. The processing pause is a setting of its own, `paused`, which `POST executor/pause` sets.
@@ -244,6 +255,9 @@ The process environment that setup writes:
 
 - **Command shims** in `<stateDir>/worker-bin`, first on `PATH`: `gh` runs the agent's CLI; `lark-cli` runs the bot's CLI; blocked commands fail. A shim removes its own directory from `PATH` before it runs its target.
 - **git configuration** in `<stateDir>/worker-gitconfig`: replaces the operator's global and system git configuration. It selects the agent CLI as the github.com credential helper, rewrites GitHub SSH addresses to HTTPS and defines Git LFS filters. Personal git settings such as an HTTP proxy do not apply. No commit identity is set here, git never prompts for credentials, and `GH_TOKEN` and `GITHUB_TOKEN` are removed.
+- **`GH_CONFIG_DIR`**, when the GitHub card names a gh configuration directory: the agent's `gh` reads its account there, in worker shells and in dsh-superagent's own commands.
+
+On Windows no shim runs a CLI: PowerShell, the shell of DSH's command tool, would change arguments on their way through a script, splitting `--json number,title` in two and dropping a bare `--`. The directories of the agent's and the bot's CLIs follow `worker-bin` on `PATH` instead, so worker shells run `gh` and `lark-cli` by name, and `GH_CONFIG_DIR`, when set, chooses the agent's account; a CLI under another name, such as a renamed copy of `gh.exe`, is not found by those names. A command that only fails, a blocked one or `lark-cli` without a Feishu bot, has three forms in `worker-bin`, and each shell picks its own: the `.ps1` one in PowerShell, the `.cmd` one in cmd and the extensionless one in Git Bash. PowerShell runs a `.ps1` under the RemoteSigned execution policy or a looser one, the default of PowerShell 7; under Restricted, the default of Windows PowerShell 5.1, the command still fails, with an execution policy error instead of its reason. As elsewhere these are defaults, not a boundary: a worker that names a program's `.exe` or full path reaches it.
 
 A file in `worker-bin` or `worker-gitconfig` that dsh-superagent did not write stops setup. A Ticket directory inside a git repository whose own configuration adds credentials fails the Ticket.
 
@@ -275,8 +289,9 @@ Setup problems appear on the overview with a link to the fix, in the panel's lan
 | Symptom | Cause and fix |
 | --- | --- |
 | `The agent GitHub CLI is not set.` | Set the agent's CLI on the GitHub card |
-| `The agent GitHub CLI was not found.` | Set the wrapper's absolute path, or a command name on `PATH` |
-| `The agent GitHub CLI cannot read its account` | Sign the wrapper in with `auth login` |
+| `The agent GitHub CLI was not found.` | Set the wrapper's absolute path, or a command name on `PATH`; on Windows, `gh.exe` or its full path, not a script |
+| `The agent's gh configuration directory … is not an absolute path.` | Set the directory's full path on the GitHub card |
+| `The agent GitHub CLI cannot read its account` | Sign the wrapper in with `auth login`, or `gh` with `GH_CONFIG_DIR` set to the gh configuration directory |
 | `@… cannot read …` or `@… cannot push to …` | Give the agent account write access to the repository |
 | `The GitHub Source names no repository.` | Set the repository, `owner/name`, on the GitHub card |
 | A Ticket fails with `The prepare command failed: …` | The output names the cause, such as a wrong clone path; fix the command, then retry the Ticket |

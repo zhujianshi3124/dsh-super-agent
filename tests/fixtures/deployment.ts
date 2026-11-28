@@ -2,6 +2,8 @@
 import type { Volatile } from '@deepseek-ai/cordis'
 import type { Deployment, Machine } from '../../src/deployment.ts'
 
+/** A stand-in CLI's file name: on Windows setup finds only `.com` and `.exe` programs. */
+export const exe = (name: string): string => process.platform === 'win32' ? `${name}.exe` : name
 /** Mutable Volatile reference for simulating live configuration updates. */
 export const reference = <T>(value: T): Volatile<T> & { set(next: T): void } => {
   let current = value

@@ -1,12 +1,13 @@
 import { execFile, spawn } from 'node:child_process'
 import { chmodSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { delimiter, join } from 'node:path'
 import { promisify } from 'node:util'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { SENSITIVE_ENV_PATTERN, type SubprocessRuntime } from '@deepseek-ai/dsh-subprocess'
-import { GIT_LOCATION, agentVariables, credentialHelper, runAsWorker, verifyDirectory, withoutDirectory, workerBin, workerGitConfig, writeEnvironment }
-  from '../src/infra/environment.ts'
+import { workerProbe } from '../src/deployment.ts'
+import { GIT_LOCATION, accountVariables, agentVariables, cliDirectories, credentialHelper, runAsWorker, verifyDirectory, withoutDirectory, workerBin,
+  workerGitConfig, writeEnvironment } from '../src/infra/environment.ts'
 import { CliError } from '../src/infra/commands.ts'
 import { testDeployment } from './fixtures/deployment.ts'
 import { gitEnv } from './fixtures/git.ts'
@@ -63,12 +64,74 @@ describe('worker shims', () => {
     expect(readFileSync(workerGitConfig(dir), 'utf8')).toBe('[user]\n\tname = someone\n')
   })
   it('replaces the files it wrote under the project\'s earlier names', async () => {
-    await writeEnvironment(testDeployment({ stateDir: dir }), ['old-cli', 'older-cli'])
+    // The earlier names wrote only the POSIX shims, which this writes on every platform.
+    await writeEnvironment(testDeployment({ stateDir: dir }), ['old-cli', 'older-cli'], 'linux')
     const legacy = (file: string, name: string) => writeFileSync(file, readFileSync(file, 'utf8').replace('Written by dsh-superagent', `Written by ${name}`))
     legacy(join(workerBin(dir), 'old-cli'), 'dsh-tag'); legacy(join(workerBin(dir), 'older-cli'), 'dsh-freelancer'); legacy(workerGitConfig(dir), 'dsh-go')
-    await writeEnvironment(testDeployment({ stateDir: dir }), [])
+    await writeEnvironment(testDeployment({ stateDir: dir }), [], 'linux')
     expect(readdirSync(workerBin(dir)).sort()).toEqual(['gh', 'lark-cli'])
     expect(readFileSync(workerGitConfig(dir), 'utf8')).toContain('Written by dsh-superagent')
+  })
+  it('write for Windows no shim that runs `gh` or `lark-cli`, and a form for each shell of each command that only fails', async () => {
+    // A login GitHub would not issue, so that the message shows each form's quoting.
+    const github = { ...testDeployment().github, login: "o'neil & co (100%)" }
+    await writeEnvironment(testDeployment({ stateDir: dir, github, feishu: undefined }), ['personal-gh'], 'win32')
+    const bin = workerBin(dir)
+    const read = (name: string): string => readFileSync(join(bin, name), 'utf8')
+    expect(readdirSync(bin).sort()).toEqual(['lark-cli', 'lark-cli.cmd', 'lark-cli.ps1', 'personal-gh', 'personal-gh.cmd', 'personal-gh.ps1'])
+    const marker = '# Written by dsh-superagent on every start; edits are lost.'
+    const lark = 'lark-cli is unavailable: this installation has no Feishu bot.'
+    const blocked = 'personal-gh is blocked in this installation; use gh, which acts as'
+    // Git Bash runs the extensionless form, PowerShell the `.ps1` one and cmd the `.cmd` one, whose marker is a comment after `@echo off`.
+    expect(read('lark-cli')).toBe(`#!/bin/sh\n${marker}\necho '${lark}' >&2\nexit 1\n`)
+    expect(read('lark-cli.ps1')).toBe(`${marker}\r\n[Console]::Error.WriteLine('${lark}')\r\nexit 1\r\n`)
+    expect(read('lark-cli.cmd')).toBe(`@echo off\r\n@rem ${marker}\r\n>&2 echo ${lark}\r\nexit /b 1\r\n`)
+    expect(read('personal-gh')).toBe(`#!/bin/sh\n${marker}\necho '${blocked} o'\\''neil & co (100%).' >&2\nexit 1\n`)
+    expect(read('personal-gh.ps1')).toBe(`${marker}\r\n[Console]::Error.WriteLine('${blocked} o''neil & co (100%).')\r\nexit 1\r\n`)
+    expect(read('personal-gh.cmd')).toBe(`@echo off\r\n@rem ${marker}\r\n>&2 echo ${blocked} o'neil ^& co ^(100%%^).\r\nexit /b 1\r\n`)
+  })
+  it('take what they wrote for one platform as their own on the other, and remove the files the other does not use', async () => {
+    const deployment = testDeployment({ stateDir: dir })
+    const files = (): string[] => readdirSync(workerBin(dir)).sort()
+    await writeEnvironment(deployment, ['personal-gh'], 'win32')
+    expect(files()).toEqual(['personal-gh', 'personal-gh.cmd', 'personal-gh.ps1'])
+    await writeEnvironment(deployment, ['personal-gh'], 'linux')
+    expect(files()).toEqual(['gh', 'lark-cli', 'personal-gh'])
+    await writeEnvironment(deployment, ['personal-gh'], 'win32')
+    expect(files()).toEqual(['personal-gh', 'personal-gh.cmd', 'personal-gh.ps1'])
+  })
+})
+
+describe('the agent\'s accounts and CLIs', () => {
+  it('choose the agent\'s gh account by its configuration directory, and put the CLIs\' own directories on PATH on Windows only', () => {
+    const base = testDeployment()
+    expect(accountVariables(base)).toEqual({})
+    expect(accountVariables(testDeployment({ github: { ...base.github, configDir: 'C:\\agent config' } }))).toEqual({ GH_CONFIG_DIR: 'C:\\agent config' })
+    const clis = (gh: string, lark?: string) => testDeployment({ github: { ...base.github, cli: gh }, feishu: lark === undefined ? undefined : { ...base.feishu!, cli: lark } })
+    // Each directory once, the agent's CLI's first.
+    expect(cliDirectories(clis('C:\\tools\\gh.exe', 'C:\\tools\\lark-cli.exe'), 'win32')).toEqual(['C:\\tools'])
+    expect(cliDirectories(clis('C:\\Program Files\\GitHub CLI\\gh.exe', 'D:\\lark\\lark-cli.exe'), 'win32')).toEqual(['C:\\Program Files\\GitHub CLI', 'D:\\lark'])
+    expect(cliDirectories(clis('C:\\tools\\gh.exe'), 'win32')).toEqual(['C:\\tools'])
+    expect(cliDirectories(clis('/usr/bin/gh', '/usr/bin/lark-cli'), 'linux')).toEqual([])
+  })
+  it('run the startup checks without the shims on PATH, their variables in the command through `env`, or on Windows in the spawn\'s environment', async () => {
+    const specs: { argv: readonly string[]; env?: Record<string, string> }[] = []
+    const reader = { readFrom: () => ({ text: '', nextOffset: 0, lossy: false }) }
+    const recording = { spawn: (spec: { argv: readonly string[]; env?: Record<string, string> }) => {
+      specs.push(spec)
+      return { done: Promise.resolve({ exitCode: 0, signal: null }), collected: { stdout: reader, stderr: reader } }
+    } } as unknown as SubprocessRuntime
+    const rest = join(dir, 'real')
+    vi.stubEnv('PATH', [workerBin(dir), rest].join(delimiter))
+    try {
+      const signal = new AbortController().signal
+      for (const platform of ['linux', 'win32'] as const) await workerProbe(recording, dir, dir, signal, platform)(['gh', 'api', 'user'], { GH_CONFIG_DIR: 'agent' })
+    } finally { vi.unstubAllEnvs() }
+    expect(specs[0]!.argv).toEqual(['env', `PATH=${rest}`, 'GH_CONFIG_DIR=agent', 'gh', 'api', 'user'])
+    expect(specs[0]).not.toHaveProperty('env')
+    // Windows has no `env` program on PATH; DSH's subprocess service lays the spawn's variables over its copy of this process's.
+    expect(specs[1]!.argv).toEqual(['gh', 'api', 'user'])
+    expect(specs[1]!.env).toEqual({ GH_CONFIG_DIR: 'agent', PATH: rest })
   })
 })
 

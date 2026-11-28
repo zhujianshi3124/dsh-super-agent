@@ -18,8 +18,8 @@ const lark = (status: object, mode = 'bot', bot: object = { bot: { open_id: 'ou_
   `case "$*" in\n  "auth status") echo '${JSON.stringify(status)}' ;;\n  "config strict-mode") echo 'strict-mode: ${mode} (source: profile)' ;;\n  "api GET /open-apis/bot/v3/info --as bot --format ndjson") echo '${JSON.stringify(bot)}' ;;\nesac`
 const minimal = (overrides: Record<string, unknown> = {}) => ({ stateDir: join(dir, 'state'), ...overrides })
 const machine = (overrides: Partial<Machine> = {}): Machine => ({ ...machineOf(Config(minimal())), ...overrides })
-/** Runs commands like worker shells do, but locally: the stand-ins first on PATH, then the system's git. */
-const probe: Probe = async argv => (await exec(argv[0]!, argv.slice(1), { env: { PATH: path, HOME: dir } })).stdout
+/** Runs commands like worker shells do, but locally: the stand-ins first on PATH, then the system's git, with the variables setup passes. */
+const probe: Probe = async (argv, env = {}) => (await exec(argv[0]!, argv.slice(1), { env: { PATH: path, HOME: dir, ...env } })).stdout
 const setupError = (place: string, code: string, values: Record<string, unknown> = {}) => expect.objectContaining({ place, code, values: expect.objectContaining(values) })
 
 beforeEach(async () => {
@@ -82,6 +82,18 @@ describe('setup', () => {
     await needs('github', 'repositoryUnreadable', { account: 'Agent-Bot', repository: 'acme/widgets', output }, { repository, cli: unreadable })
     await needs('github', 'agentCliNoAccount', {}, { repository, cli: program(join(dir, 'bin', 'gh-anonymous'), `echo '{}'`) })
     expect(() => executable('nothing-here', join(dir, 'bin'))).toThrow('nothing-here is not an executable file on PATH')
+  })
+  it('reads the agent account from the gh configuration directory the GitHub Source names, which must be an absolute path', async () => {
+    // A gh signed in to the agent account only in the agent's configuration directory, as an operator's own gh would be.
+    const config = join(dir, 'gh-agent')
+    const shared = program(join(dir, 'bin', 'gh-shared'), `[ "$GH_CONFIG_DIR" = '${config}' ] || { echo 'not logged in' >&2; exit 1; }\nexec '${join(dir, 'bin', 'gh')}' "$@"`)
+    const deployment = await resolveDeployment(machine(), { repository: 'acme/widgets', cli: shared, configDir: config }, probe, path)
+    expect(deployment.github).toEqual({ cli: shared, login: 'Agent-Bot', noreply: '7+Agent-Bot@users.noreply.github.com', configDir: config })
+    // Without the directory the same CLI reads no account, and a deployment that names none has none.
+    await expect(resolveDeployment(machine(), { repository: 'acme/widgets', cli: shared }, probe, path)).rejects.toEqual(setupError('github', 'agentCliSignedOut'))
+    expect((await resolveDeployment(machine(), { repository: 'acme/widgets', cli: 'gh' }, probe, path)).github).not.toHaveProperty('configDir')
+    await expect(resolveDeployment(machine(), { repository: 'acme/widgets', cli: shared, configDir: 'gh-agent' }, probe, path))
+      .rejects.toEqual(setupError('github', 'agentConfigDirRelative', { directory: 'gh-agent' }))
   })
   it('reads the Feishu bot from a bot-only lark-cli, or finds none when the Feishu Source names no CLI', async () => {
     expect(await resolveFeishuBot(machine(), {}, probe, path)).toBeUndefined()

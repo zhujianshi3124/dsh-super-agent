@@ -11,7 +11,7 @@ import { Runtime } from '../src/app/runtime.ts'
 import { jobRegistry, subagentRuntime } from './fixtures/host.ts'
 import { mandateInstructions } from '../src/executor/dsh.ts'
 import { masterPrompt } from '../src/app/context.ts'
-import { reference, testMachine } from './fixtures/deployment.ts'
+import { exe, reference, testMachine } from './fixtures/deployment.ts'
 import type { Machine } from '../src/deployment.ts'
 import { SCHEMA_VERSION, Store } from '../src/app/store.ts'
 import { TextCache } from '../src/app/cache.ts'
@@ -82,12 +82,12 @@ let jobs: ReturnType<typeof jobRegistry>
 /** What worker commands of the startup checks print, by argv; an Error makes the command fail with its message. */
 let answers: Record<string, string | Error>
 /** Stand-in CLIs on disk, since setup finds executables before it runs them: the agent's, the merge account's and the Feishu bot's. */
-const AGENT = () => join(directory, 'agent-gh')
-const OTHER = () => join(directory, 'other-gh')
-const BOT = () => join(directory, 'lark-bot')
+const AGENT = () => join(directory, exe('agent-gh'))
+const OTHER = () => join(directory, exe('other-gh'))
+const BOT = () => join(directory, exe('lark-bot'))
 const HELPERS = 'git config -z --show-origin --get-all credential.https://github.com.helper'
 const SCOPED = 'git config -z --show-scope --get-regexp ^(credential\\..*|http\\..*extraheader)$'
-const subprocess = { spawn: vi.fn((spec: { argv: readonly string[] }) => {
+const subprocess = { spawn: vi.fn((spec: { argv: readonly string[]; env?: Record<string, string> }) => {
   // Strip leading `env` and `KEY=VALUE` arguments before looking up the command response.
   const argv = [...spec.argv]
   while (argv[0] === 'env' || /^[A-Z_]+=/.test(argv[0] ?? '')) argv.shift()
@@ -592,16 +592,19 @@ it('reports each setup problem where the operator fixes it, and checks the agent
   answers[`${AGENT()} api repos/acme/widgets --jq {name: .full_name, push: .permissions.push}`] = '{"name":"acme/widgets","push":false}\n'
   await needs('github', 'repositoryReadOnly', { account: 'agent-bot', repository: 'acme/widgets' })
   answers[`${AGENT()} api repos/acme/widgets --jq {name: .full_name, push: .permissions.push}`] = '{"name":"acme/widgets","push":true}\n'
-  // The agent CLI runs in the workers' environment: without the shims on PATH.
-  const check = subprocess.spawn.mock.calls.map(([spec]) => spec.argv).find(argv => argv.includes(AGENT()))!
-  expect(check[0]).toBe('env')
-  expect(check[1]!.startsWith('PATH=')).toBe(true)
-  expect(check[1]!.slice('PATH='.length).split(':')).not.toContain(join(directory, 'worker-bin'))
+  // The agent CLI runs in the workers' environment: without the shims on PATH, which the check sets through `env`, or on
+  // Windows, which has no `env` program on PATH, in the spawn's environment.
+  const check = subprocess.spawn.mock.calls.map(([spec]) => spec).find(spec => spec.argv.includes(AGENT()))!
+  let path: string | undefined
+  if (process.platform === 'win32') { expect(check.argv[0]).toBe(AGENT()); path = check.env?.PATH }
+  else { expect(check.argv[0]).toBe('env'); expect(check.argv[1]!.startsWith('PATH=')).toBe(true); path = check.argv[1]!.slice('PATH='.length) }
+  expect(path!.split(delimiter)).not.toContain(join(directory, 'worker-bin'))
   const valid = { ...answers }
   // git older than 2.32 ignores GIT_CONFIG_GLOBAL and reads the operator's configuration.
   answers = { ...valid, [HELPERS]: 'file:/home/me/.gitconfig\0!gh auth git-credential\0' }
   await needs('deployment', 'gitTooOld', {})
   await needs('github', 'repositoryUnset', {}, { github: { repository: '' } })
+  await needs('github', 'agentConfigDirRelative', { directory: 'gh-agent' }, { github: { configDir: 'gh-agent' } })
   // A broken Feishu bot leaves Feishu out and says why; GitHub work goes on.
   answers = { ...valid, [`${BOT()} config strict-mode`]: 'strict-mode: off (source: profile)' }
   const next = await restart()
@@ -719,6 +722,25 @@ it('leaves the process environment alone in a local-only installation, which wri
   expect(process.env.PATH?.split(delimiter)).not.toContain(join(directory, 'worker-bin'))
 })
 
+it('signs the agent\'s gh in through the gh configuration directory the GitHub Source names, in setup\'s checks and in the agent\'s environment, until it stops', async () => {
+  const config = join(directory, 'gh-agent'), before = process.env.GH_CONFIG_DIR
+  const calls = subprocess.spawn.mock.calls.length
+  const next = await restart({}, { github: { configDir: config } })
+  await next.ready
+  expect(next.configured()).toBe(true)
+  const checks = subprocess.spawn.mock.calls.slice(calls).map(([spec]) => spec).filter(spec => spec.argv.includes(AGENT()))
+  expect(checks.length).toBeGreaterThan(1)
+  for (const spec of checks) {
+    if (process.platform === 'win32') expect(spec.env).toMatchObject({ GH_CONFIG_DIR: config })
+    else expect(spec.argv).toContain(`GH_CONFIG_DIR=${config}`)
+  }
+  expect(process.env.GH_CONFIG_DIR).toBe(config)
+  // On Windows, where no shim runs gh, worker shells find the agent's CLI by name in its own directory, right after the shims.
+  if (process.platform === 'win32') expect(process.env.PATH?.split(delimiter).slice(0, 2)).toEqual([join(directory, 'worker-bin'), directory])
+  await next.stop()
+  expect(process.env.GH_CONFIG_DIR).toBe(before)
+})
+
 it.skipIf(process.platform === 'win32')('writes worker shims and the agent environment from the configuration only, and restores the environment on stop', async () => {
   const bin = join(directory, 'worker-bin')
   expect(readdirSync(bin).sort()).toEqual(['gh', 'lark-cli'])
@@ -752,10 +774,12 @@ it('waits for setup when the shim directory holds a file dsh-superagent did not 
 it('rewrites the blocked-command shims when the Executor settings change them, without a restart', async () => {
   const bin = join(directory, 'worker-bin')
   const save = (blockedCommands: string[]) => runtime.settings.save('executor', { ...runtime.store.settings().executor, blockedCommands }, runtime.store.blockRevision('executor'), 'panel')
+  // On Windows no shim runs gh or lark-cli, and a blocked command has a form for each shell (`writeEnvironment`).
+  const windows = process.platform === 'win32'
   expect(await save(['personal-gh'])).toMatchObject({ saved: true, restarting: false })
-  expect(readdirSync(bin).sort()).toEqual(['gh', 'lark-cli', 'personal-gh'])
+  expect(readdirSync(bin).sort()).toEqual(windows ? ['personal-gh', 'personal-gh.cmd', 'personal-gh.ps1'] : ['gh', 'lark-cli', 'personal-gh'])
   await save([])
-  expect(readdirSync(bin).sort()).toEqual(['gh', 'lark-cli'])
+  expect(readdirSync(bin).sort()).toEqual(windows ? [] : ['gh', 'lark-cli'])
   // The commands workers need cannot be blocked.
   await expect(save(['gh'])).rejects.toThrow()
   expect(restarts).not.toHaveBeenCalled()

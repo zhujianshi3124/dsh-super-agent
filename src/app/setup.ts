@@ -1,8 +1,9 @@
 /** Probes repository and account CLIs, configures the worker execution environment and command shims, and tracks setup readiness. */
+import { delimiter } from 'node:path'
 import type { Context } from '@deepseek-ai/cordis'
 import { UserError } from '../core/index.ts'
 import { SETUP_FIELDS, resolveDeployment, resolveFeishuBot, workerProbe, type Deployment, type Machine } from '../deployment.ts'
-import { agentVariables, applyEnvironment, verifyEnvironment, withoutDirectory, workerBin, writeEnvironment } from '../infra/environment.ts'
+import { accountVariables, agentVariables, applyEnvironment, cliDirectories, verifyEnvironment, withoutDirectory, workerBin, writeEnvironment } from '../infra/environment.ts'
 import type { Settings, SettingsBlock } from '../policy.ts'
 import { SetupError, type SetupProblem } from '../setup.ts'
 
@@ -78,8 +79,8 @@ export class Setup {
   private async resolve(settings: Settings): Promise<Deployment> {
     const { context, machine, lifetime } = this.host
     const probe = this.probe()
-    // Desktop move: Windows has no gh CLI, so GitHub delivery is disabled.
-    // Run a local-only deployment instead of blocking dispatch/sessions.
+    // With the GitHub Source off or naming no CLI, as the desktop build ships, run a local-only deployment
+    // instead of blocking dispatch and Sessions.
     const github = settings.sources.github
     const localOnly = github?.enabled === false || !github?.config?.cli
     const deployment = localOnly
@@ -102,7 +103,9 @@ export class Setup {
     this.localOnly = localOnly
     if (localOnly) return resolved
     await writeEnvironment(resolved, settings.executor.blockedCommands).catch(machineProblem)
-    this.restoreEnvironment = applyEnvironment(this.variables, machine.stateDir, this.path)
+    // The account variables reach the host's own commands through this process's environment too: `Commands` reads it on every run.
+    this.restoreEnvironment = applyEnvironment({ ...this.variables, ...accountVariables(resolved) }, machine.stateDir,
+      [...cliDirectories(resolved), this.path].join(delimiter))
     await verifyEnvironment(resolved, context.subprocess, lifetime).catch((error: unknown) => {
       this.restore()
       machineProblem(error)
